@@ -1,5 +1,5 @@
--- ==============================================================================
--- FINAL SCRIPT V14.0 - CORRECTED VERSION
+﻿-- ==============================================================================
+-- ========== SCRIPT SQL FINAL V15 ==========
 -- Description: Installation complète sur projet vierge (BUGS CORRIGÉS)
 -- Features: Stripe Connect, Identity, Escrow 5%, Payouts, Logs, Automations
 -- ==============================================================================
