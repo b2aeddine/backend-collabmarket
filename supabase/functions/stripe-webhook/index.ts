@@ -83,7 +83,7 @@ serve(async (req) => {
       });
     }
 
-    await supabase
+    const { error: logError } = await supabase
       .from("payment_logs")
       .upsert(
         {
@@ -98,6 +98,17 @@ serve(async (req) => {
         },
         { onConflict: "stripe_event_id" }
       );
+
+    if (logError) {
+      console.error("Failed to log stripe event", logError);
+      return new Response(
+        JSON.stringify({ error: "Failed to record event for idempotency" }),
+        {
+          status: 500,
+          headers: corsHeaders,
+        }
+      );
+    }
 
     // Traitement par type d'événement
     switch (event.type) {
@@ -324,10 +335,18 @@ serve(async (req) => {
         console.log(`[Webhook] Unhandled event type: ${event.type}`);
     }
 
-    await supabase
+    const { error: markProcessedError } = await supabase
       .from("payment_logs")
       .update({ processed: true })
       .eq("stripe_event_id", event.id);
+
+    if (markProcessedError) {
+      console.error("Failed to mark event processed", markProcessedError);
+      return new Response(JSON.stringify({ error: "Persistence error" }), {
+        status: 500,
+        headers: corsHeaders,
+      });
+    }
 
     return new Response(JSON.stringify({ received: true }), {
       status: 200,

@@ -82,7 +82,7 @@ serve(async (req) => {
       });
     }
 
-    await supabase
+    const { error: logError } = await supabase
       .from("payment_logs")
       .upsert(
         {
@@ -94,6 +94,17 @@ serve(async (req) => {
         },
         { onConflict: "stripe_event_id" }
       );
+
+    if (logError) {
+      console.error("Failed to log payout event", logError);
+      return new Response(
+        JSON.stringify({ error: "Failed to record payout event" }),
+        {
+          status: 500,
+          headers: corsHeaders,
+        }
+      );
+    }
 
     switch (event.type) {
       case "payout.paid": {
@@ -272,10 +283,18 @@ serve(async (req) => {
         console.log(`[Payout Webhook] Unhandled event: ${event.type}`);
     }
 
-    await supabase
+    const { error: markProcessedError } = await supabase
       .from("payment_logs")
       .update({ processed: true })
       .eq("stripe_event_id", event.id);
+
+    if (markProcessedError) {
+      console.error("Failed to mark payout event processed", markProcessedError);
+      return new Response(JSON.stringify({ error: "Persistence error" }), {
+        status: 500,
+        headers: corsHeaders,
+      });
+    }
 
     return new Response(JSON.stringify({ received: true }), {
       status: 200,
