@@ -7,9 +7,13 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
+const allowedOrigin =
+  Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, stripe-signature",
+  "Access-Control-Allow-Origin": allowedOrigin,
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, stripe-signature",
 };
 
 serve(async (req) => {
@@ -34,24 +38,62 @@ serve(async (req) => {
 
     let event: Stripe.Event;
 
-    // Vérification de signature
-    if (webhookSecret && signature) {
-      try {
-        event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
-      } catch (err: unknown) {
-        const error = err as Error;
-        console.error("Webhook signature verification failed:", error.message);
-        return new Response(JSON.stringify({ error: "Invalid signature" }), {
-          status: 400,
-          headers: corsHeaders,
-        });
-      }
-    } else {
-      event = JSON.parse(body);
-      console.warn("⚠️ Webhook received without signature verification");
+    // Vérification de signature obligatoire
+    if (!webhookSecret) {
+      console.error("Withdrawal webhook secret not configured");
+      return new Response(JSON.stringify({ error: "Webhook not configured" }), {
+        status: 500,
+        headers: corsHeaders,
+      });
+    }
+
+    if (!signature) {
+      console.warn("Missing Stripe signature header");
+      return new Response(JSON.stringify({ error: "Missing signature" }), {
+        status: 401,
+        headers: corsHeaders,
+      });
+    }
+
+    try {
+      event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+    } catch (err: unknown) {
+      const error = err as Error;
+      console.error("Webhook signature verification failed:", error.message);
+      return new Response(JSON.stringify({ error: "Invalid signature" }), {
+        status: 400,
+        headers: corsHeaders,
+      });
     }
 
     console.log(`[Payout Webhook] Event: ${event.type}, ID: ${event.id}`);
+
+    const { data: existingLog } = await supabase
+      .from("payment_logs")
+      .select("id, processed")
+      .eq("stripe_event_id", event.id)
+      .maybeSingle();
+
+    if (existingLog?.processed) {
+      console.log("Payout event already processed, skipping", event.id);
+      return new Response(JSON.stringify({ received: true, skipped: true }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    await supabase
+      .from("payment_logs")
+      .upsert(
+        {
+          stripe_event_id: event.id,
+          event_type: event.type,
+          event_data: event.data.object as Record<string, unknown>,
+          stripe_payment_intent_id: (event.data.object as { id?: string }).id,
+          processed: false,
+        },
+        { onConflict: "stripe_event_id" }
+      );
 
     switch (event.type) {
       case "payout.paid": {
@@ -65,11 +107,16 @@ serve(async (req) => {
           // Récupérer le retrait pour avoir l'influencer_id
           const { data: withdrawal } = await supabase
             .from("withdrawals")
-            .select("influencer_id, amount")
+            .select("influencer_id, amount, status")
             .eq("id", withdrawalId)
             .single();
 
           if (withdrawal) {
+            if (withdrawal.status === "completed") {
+              console.log("Withdrawal already completed, skipping", withdrawalId);
+              break;
+            }
+
             // Mettre à jour le retrait
             await supabase
               .from("withdrawals")
@@ -91,11 +138,16 @@ serve(async (req) => {
           // Fallback: chercher par stripe_payout_id
           const { data: withdrawal } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount")
+            .select("id, influencer_id, amount, status")
             .eq("stripe_payout_id", payout.id)
             .single();
 
           if (withdrawal) {
+            if (withdrawal.status === "completed") {
+              console.log("Withdrawal already completed, skipping", withdrawal.id);
+              break;
+            }
+
             await supabase
               .from("withdrawals")
               .update({
@@ -126,11 +178,16 @@ serve(async (req) => {
           // Récupérer le retrait
           const { data: withdrawal } = await supabase
             .from("withdrawals")
-            .select("influencer_id, amount")
+            .select("influencer_id, amount, status")
             .eq("id", withdrawalId)
             .single();
 
           if (withdrawal) {
+            if (withdrawal.status === "failed") {
+              console.log("Withdrawal already failed, skipping", withdrawalId);
+              break;
+            }
+
             // Marquer comme échoué
             await supabase
               .from("withdrawals")
@@ -152,11 +209,16 @@ serve(async (req) => {
           // Fallback
           const { data: withdrawal } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount")
+            .select("id, influencer_id, amount, status")
             .eq("stripe_payout_id", payout.id)
             .single();
 
           if (withdrawal) {
+            if (withdrawal.status === "failed") {
+              console.log("Withdrawal already failed, skipping", withdrawal.id);
+              break;
+            }
+
             await supabase
               .from("withdrawals")
               .update({
@@ -180,11 +242,16 @@ serve(async (req) => {
 
         const { data: withdrawal } = await supabase
           .from("withdrawals")
-          .select("id, influencer_id, amount")
+          .select("id, influencer_id, amount, status")
           .eq("stripe_payout_id", payout.id)
           .single();
 
         if (withdrawal) {
+          if (withdrawal.status === "failed" || withdrawal.status === "completed") {
+            console.log("Withdrawal already finalized, skipping", withdrawal.id);
+            break;
+          }
+
           await supabase
             .from("withdrawals")
             .update({
@@ -204,6 +271,11 @@ serve(async (req) => {
       default:
         console.log(`[Payout Webhook] Unhandled event: ${event.type}`);
     }
+
+    await supabase
+      .from("payment_logs")
+      .update({ processed: true })
+      .eq("stripe_event_id", event.id);
 
     return new Response(JSON.stringify({ received: true }), {
       status: 200,

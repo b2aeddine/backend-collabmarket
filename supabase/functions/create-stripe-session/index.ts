@@ -8,8 +8,11 @@ import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
+const allowedOrigin =
+  Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": allowedOrigin,
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
@@ -85,13 +88,51 @@ serve(async (req) => {
       throw new Error(`Cannot create payment session for order with status: ${order.status}`);
     }
 
-    console.log(`[Create Stripe Session] Order: ${orderId}, Amount: ${order.total_amount}€`);
-
     // Init Stripe
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
       apiVersion: "2023-10-16",
       httpClient: Stripe.createFetchHttpClient(),
     });
+
+    // Empêcher la création de sessions concurrentes
+    if (order.stripe_payment_intent_id) {
+      const existingIntent = await stripe.paymentIntents.retrieve(
+        order.stripe_payment_intent_id
+      );
+
+      if (
+        existingIntent.status === "requires_capture" ||
+        existingIntent.status === "succeeded"
+      ) {
+        throw new Error("Payment already in progress or completed for this order");
+      }
+    }
+
+    if (order.stripe_checkout_session_id) {
+      try {
+        const existingSession = await stripe.checkout.sessions.retrieve(
+          order.stripe_checkout_session_id
+        );
+
+        if (existingSession.status === "open" && existingSession.url) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              sessionId: existingSession.id,
+              url: existingSession.url,
+            }),
+            {
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+              status: 200,
+            }
+          );
+        }
+      } catch (err) {
+        console.warn("Existing session retrieval failed, creating a new one", err);
+      }
+    }
+
+    console.log(`[Create Stripe Session] Order: ${orderId}, Amount: ${order.total_amount}€`);
 
     const baseUrl = Deno.env.get("PUBLIC_SITE_URL") || "https://collabmarket.fr";
     const offerTitle = (order.offers as { title?: string } | null)?.title || "Commande CollabMarket";

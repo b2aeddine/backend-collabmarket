@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS public.payment_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   stripe_session_id TEXT,
   stripe_payment_intent_id TEXT,
+  stripe_event_id TEXT UNIQUE,
   event_type TEXT NOT NULL,
   event_data JSONB,
   order_id UUID,

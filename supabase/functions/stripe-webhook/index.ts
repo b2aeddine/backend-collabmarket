@@ -8,9 +8,13 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 
+const allowedOrigin =
+  Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, stripe-signature",
+  "Access-Control-Allow-Origin": allowedOrigin,
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, stripe-signature",
 };
 
 serve(async (req) => {
@@ -35,32 +39,65 @@ serve(async (req) => {
 
     let event: Stripe.Event;
 
-    // Vérification de signature
-    if (webhookSecret && signature) {
-      try {
-        event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
-      } catch (err: unknown) {
-        const error = err as Error;
-        console.error("Webhook signature verification failed:", error.message);
-        return new Response(JSON.stringify({ error: "Invalid signature" }), {
-          status: 400,
-          headers: corsHeaders,
-        });
-      }
-    } else {
-      // Fallback sans vérification (dev only)
-      event = JSON.parse(body);
-      console.warn("⚠️ Webhook received without signature verification");
+    // Vérification de signature obligatoire
+    if (!webhookSecret) {
+      console.error("Webhook secret not configured");
+      return new Response(JSON.stringify({ error: "Webhook not configured" }), {
+        status: 500,
+        headers: corsHeaders,
+      });
+    }
+
+    if (!signature) {
+      console.warn("Missing Stripe signature header");
+      return new Response(JSON.stringify({ error: "Missing signature" }), {
+        status: 401,
+        headers: corsHeaders,
+      });
+    }
+
+    try {
+      event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+    } catch (err: unknown) {
+      const error = err as Error;
+      console.error("Webhook signature verification failed:", error.message);
+      return new Response(JSON.stringify({ error: "Invalid signature" }), {
+        status: 400,
+        headers: corsHeaders,
+      });
     }
 
     console.log(`[Stripe Webhook] Event: ${event.type}, ID: ${event.id}`);
 
-    // Log l'événement
-    await supabase.from("payment_logs").insert({
-      event_type: event.type,
-      event_data: event.data.object as Record<string, unknown>,
-      stripe_payment_intent_id: (event.data.object as { id?: string }).id,
-    });
+    const { data: existingLog } = await supabase
+      .from("payment_logs")
+      .select("id, processed")
+      .eq("stripe_event_id", event.id)
+      .maybeSingle();
+
+    if (existingLog?.processed) {
+      console.log("Event already processed, skipping", event.id);
+      return new Response(JSON.stringify({ received: true, skipped: true }), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    await supabase
+      .from("payment_logs")
+      .upsert(
+        {
+          stripe_event_id: event.id,
+          event_type: event.type,
+          event_data: event.data.object as Record<string, unknown>,
+          stripe_payment_intent_id: (event.data.object as { id?: string }).id,
+          order_id:
+            (event.data.object as { metadata?: { order_id?: string } })
+              .metadata?.order_id || null,
+          processed: false,
+        },
+        { onConflict: "stripe_event_id" }
+      );
 
     // Traitement par type d'événement
     switch (event.type) {
@@ -71,6 +108,21 @@ serve(async (req) => {
 
         if (orderId) {
           console.log(`[Webhook] Payment authorized for order: ${orderId}`);
+
+          const { data: orderStatus } = await supabase
+            .from("orders")
+            .select("stripe_payment_status")
+            .eq("id", orderId)
+            .single();
+
+          if (
+            orderStatus?.stripe_payment_status === "requires_capture" ||
+            orderStatus?.stripe_payment_status === "captured" ||
+            orderStatus?.stripe_payment_status === "refunded"
+          ) {
+            console.log("Order already authorized or finalized, skipping", orderId);
+            break;
+          }
 
           // FIX V20: Utiliser "requires_capture" qui est dans la contrainte CHECK
           // Le trigger sync_stripe_status_to_order passera automatiquement à payment_authorized
@@ -98,6 +150,20 @@ serve(async (req) => {
         if (orderId) {
           console.log(`[Webhook] Payment captured for order: ${orderId}`);
 
+          const { data: orderStatus } = await supabase
+            .from("orders")
+            .select("stripe_payment_status")
+            .eq("id", orderId)
+            .single();
+
+          if (
+            orderStatus?.stripe_payment_status === "captured" ||
+            orderStatus?.stripe_payment_status === "refunded"
+          ) {
+            console.log("Order already captured or refunded, skipping", orderId);
+            break;
+          }
+
           await supabase
             .from("orders")
             .update({
@@ -117,6 +183,17 @@ serve(async (req) => {
         if (orderId) {
           console.log(`[Webhook] Payment canceled for order: ${orderId}`);
 
+          const { data: orderStatus } = await supabase
+            .from("orders")
+            .select("stripe_payment_status")
+            .eq("id", orderId)
+            .single();
+
+          if (orderStatus?.stripe_payment_status === "canceled") {
+            console.log("Order already cancelled, skipping", orderId);
+            break;
+          }
+
           await supabase
             .from("orders")
             .update({
@@ -135,6 +212,17 @@ serve(async (req) => {
 
         if (paymentIntentId) {
           console.log(`[Webhook] Refund processed for PI: ${paymentIntentId}`);
+
+          const { data: orderStatus } = await supabase
+            .from("orders")
+            .select("stripe_payment_status")
+            .eq("stripe_payment_intent_id", paymentIntentId)
+            .single();
+
+          if (orderStatus?.stripe_payment_status === "refunded") {
+            console.log("Order already refunded, skipping", paymentIntentId);
+            break;
+          }
 
           await supabase
             .from("orders")
@@ -156,17 +244,19 @@ serve(async (req) => {
 
           const { data: order } = await supabase
             .from("orders")
-            .select("id")
+            .select("id, stripe_payment_intent_id")
             .eq("stripe_checkout_session_id", session.id)
             .single();
 
           if (order && session.payment_intent) {
-            await supabase
-              .from("orders")
-              .update({
-                stripe_payment_intent_id: session.payment_intent as string,
-              })
-              .eq("id", order.id);
+            if (!order.stripe_payment_intent_id) {
+              await supabase
+                .from("orders")
+                .update({
+                  stripe_payment_intent_id: session.payment_intent as string,
+                })
+                .eq("id", order.id);
+            }
           }
         }
         break;
@@ -233,6 +323,11 @@ serve(async (req) => {
       default:
         console.log(`[Webhook] Unhandled event type: ${event.type}`);
     }
+
+    await supabase
+      .from("payment_logs")
+      .update({ processed: true })
+      .eq("stripe_event_id", event.id);
 
     return new Response(JSON.stringify({ received: true }), {
       status: 200,
