@@ -68,8 +68,9 @@ serve(async (req) => {
       throw new Error(`Cannot complete order. Influencer must submit work first (Current status: ${order.status})`);
     }
 
-    // Vérification financière
-    if (order.stripe_payment_status !== "captured") {
+    // FIX V20: Accepter "succeeded" en plus de "captured"
+    // Le webhook Stripe peut mettre l'un ou l'autre selon le timing
+    if (!["captured", "succeeded"].includes(order.stripe_payment_status)) {
       throw new Error("Payment integrity check failed: Funds not captured.");
     }
 
