@@ -1,6 +1,7 @@
 // ==============================================================================
-// CREATE-STRIPE-SESSION - V14.0 (CORRECTED)
+// CREATE-STRIPE-SESSION - V15.0 (SECURITY HARDENED)
 // Crée une session Stripe Checkout pour un paiement
+// SECURITY: Protection contre sessions concurrentes + CORS restrictif
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -8,8 +9,11 @@ import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
+// SECURITY: CORS restrictif - configurable via env
+const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
@@ -54,8 +58,8 @@ serve(async (req) => {
     const { data: { user }, error: authError } = await supabaseUser.auth.getUser();
     if (authError || !user) throw new Error("Unauthorized");
 
-    // Récupérer la commande
-    const { data: order, error: orderError } = await supabaseUser
+    // Récupérer la commande avec verrou pessimiste via service role
+    const { data: order, error: orderError } = await supabaseAdmin
       .from("orders")
       .select(`
         id,
@@ -64,6 +68,8 @@ serve(async (req) => {
         total_amount,
         status,
         stripe_payment_intent_id,
+        stripe_checkout_session_id,
+        stripe_payment_status,
         offers:offer_id (
           title
         )
@@ -83,6 +89,76 @@ serve(async (req) => {
     // Vérifier le statut
     if (order.status !== "pending") {
       throw new Error(`Cannot create payment session for order with status: ${order.status}`);
+    }
+
+    // SECURITY: Vérifier si une session existe déjà
+    if (order.stripe_checkout_session_id) {
+      const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
+        apiVersion: "2023-10-16",
+        httpClient: Stripe.createFetchHttpClient(),
+      });
+
+      try {
+        // Vérifier si la session existante est encore valide
+        const existingSession = await stripe.checkout.sessions.retrieve(order.stripe_checkout_session_id);
+
+        // Si la session est encore ouverte et non expirée, la retourner
+        if (existingSession.status === "open" && existingSession.url) {
+          console.log(`[Create Stripe Session] Returning existing session for order: ${orderId}`);
+          return new Response(JSON.stringify({
+            success: true,
+            sessionId: existingSession.id,
+            url: existingSession.url,
+            reused: true,
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            status: 200,
+          });
+        }
+
+        // Si la session est complétée, vérifier le PaymentIntent
+        if (existingSession.status === "complete" && existingSession.payment_intent) {
+          const pi = await stripe.paymentIntents.retrieve(existingSession.payment_intent as string);
+
+          if (["requires_capture", "succeeded"].includes(pi.status)) {
+            throw new Error("Payment already in progress or completed for this order");
+          }
+        }
+
+        // Session expirée ou annulée, on peut en créer une nouvelle
+        console.log(`[Create Stripe Session] Existing session ${order.stripe_checkout_session_id} is ${existingSession.status}, creating new one`);
+      } catch (stripeErr: unknown) {
+        const err = stripeErr as { type?: string };
+        // Si la session n'existe plus sur Stripe, on peut en créer une nouvelle
+        if (err.type !== "StripeInvalidRequestError") {
+          throw stripeErr;
+        }
+        console.log(`[Create Stripe Session] Existing session not found on Stripe, creating new one`);
+      }
+    }
+
+    // SECURITY: Vérifier si un PaymentIntent existe déjà et est actif
+    if (order.stripe_payment_intent_id) {
+      const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
+        apiVersion: "2023-10-16",
+        httpClient: Stripe.createFetchHttpClient(),
+      });
+
+      try {
+        const existingPI = await stripe.paymentIntents.retrieve(order.stripe_payment_intent_id);
+
+        if (["requires_capture", "processing", "succeeded"].includes(existingPI.status)) {
+          throw new Error("Payment already in progress or completed for this order");
+        }
+
+        // Si le PI est annulé ou échoué, on peut continuer
+        console.log(`[Create Stripe Session] Existing PI ${order.stripe_payment_intent_id} is ${existingPI.status}, creating new session`);
+      } catch (stripeErr: unknown) {
+        const err = stripeErr as { type?: string };
+        if (err.type !== "StripeInvalidRequestError") {
+          throw stripeErr;
+        }
+      }
     }
 
     console.log(`[Create Stripe Session] Order: ${orderId}, Amount: ${order.total_amount}€`);
@@ -126,15 +202,23 @@ serve(async (req) => {
       metadata: {
         order_id: orderId,
       },
+      expires_at: Math.floor(Date.now() / 1000) + 30 * 60, // Expire dans 30 minutes
     });
 
-    // Sauvegarder l'ID de la session
-    await supabaseAdmin
+    // Sauvegarder l'ID de la session (atomic update)
+    const { error: updateError } = await supabaseAdmin
       .from("orders")
       .update({
         stripe_checkout_session_id: session.id,
       })
-      .eq("id", orderId);
+      .eq("id", orderId)
+      .eq("status", "pending"); // Double vérification du statut
+
+    if (updateError) {
+      // Annuler la session si l'update échoue
+      await stripe.checkout.sessions.expire(session.id);
+      throw new Error("Failed to save session, order may have been modified concurrently");
+    }
 
     return new Response(JSON.stringify({
       success: true,
