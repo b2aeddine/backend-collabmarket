@@ -86,27 +86,31 @@ serve(async (req) => {
       }
     }
 
-    // Mise à jour DB via RPC - Passe à 'accepted'
-    const { error: rpcError } = await supabase.rpc("safe_update_order_status", {
-      p_order_id: orderId,
-      p_new_status: "accepted",
-    });
-
-    if (rpcError) {
-      console.error("CRITICAL: Payment captured BUT DB update failed", rpcError);
-      throw new Error("Payment captured but order status update failed");
-    }
-
-    // Mise à jour du stripe_payment_status via admin client
+    // FIX V20: Utiliser le service role pour mettre stripe_payment_status
+    // Le trigger sync_stripe_status_to_order fera automatiquement la transition vers 'accepted'
+    // Plus besoin d'appeler safe_update_order_status (c'était redondant et échouait)
     const supabaseAdmin = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
 
-    await supabaseAdmin
+    const { error: updateError } = await supabaseAdmin
       .from("orders")
-      .update({ stripe_payment_status: "captured", captured_at: new Date().toISOString() })
+      .update({
+        stripe_payment_status: "captured",
+        captured_at: new Date().toISOString(),
+      })
       .eq("id", orderId);
+
+    if (updateError) {
+      console.error("CRITICAL: Payment captured BUT DB update failed", updateError);
+      throw new Error("Payment captured but order status update failed");
+    }
+
+    // Le trigger sync_stripe_status_to_order a automatiquement:
+    // 1. Mis status = 'accepted'
+    // 2. Mis accepted_at = NOW()
+    console.log(`Order ${orderId} automatically transitioned to 'accepted' via trigger`);
 
     return new Response(JSON.stringify({
       success: true,

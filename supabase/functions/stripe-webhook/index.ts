@@ -72,10 +72,12 @@ serve(async (req) => {
         if (orderId) {
           console.log(`[Webhook] Payment authorized for order: ${orderId}`);
 
+          // FIX V20: Utiliser "requires_capture" qui est dans la contrainte CHECK
+          // Le trigger sync_stripe_status_to_order passera automatiquement à payment_authorized
           const { error } = await supabase
             .from("orders")
             .update({
-              stripe_payment_status: "authorized",
+              stripe_payment_status: "requires_capture",
               payment_authorized_at: new Date().toISOString(),
             })
             .eq("id", orderId)
