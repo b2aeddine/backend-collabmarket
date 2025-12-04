@@ -1141,33 +1141,40 @@ BEGIN
       WHEN p_new_status = 'disputed' THEN NOW() ELSE dispute_opened_at END
   WHERE id = p_order_id;
 
-  -- Création revenu à completion (pending)
+  -- FIX V20.1: Création revenu directement disponible à completion
+  -- Les fonds sont immédiatement disponibles pour retrait après validation merchant
   IF p_new_status = 'completed'
      AND v_order.status NOT IN ('completed','finished') THEN
-    INSERT INTO public.revenues (influencer_id, order_id, amount, net_amount, commission, status)
+    INSERT INTO public.revenues (
+      influencer_id, order_id, amount, net_amount, commission,
+      status, available_at
+    )
     VALUES (
       v_order.influencer_id,
       p_order_id,
       v_order.total_amount,
       v_order.net_amount,
       v_order.total_amount - v_order.net_amount,
-      'pending'
+      'available',  -- Directement disponible
+      NOW()
     )
     ON CONFLICT (order_id) DO NOTHING;
-  END IF;
 
-  -- Passage à finished => revenus disponibles immédiatement
-  IF p_new_status = 'finished' THEN
-    UPDATE public.revenues
-    SET status = 'available',
-        available_at = NOW(),
-        updated_at = NOW()
-    WHERE order_id = p_order_id AND status IN ('pending','available');
-
+    -- Incrémenter les stats de l'influenceur immédiatement
     UPDATE public.profiles
     SET completed_orders_count = completed_orders_count + 1,
         updated_at = NOW()
     WHERE id = v_order.influencer_id;
+  END IF;
+
+  -- Passage à finished (utilisé uniquement par admin_resolve_dispute)
+  -- Garde la logique pour compatibilité avec résolution de litiges
+  IF p_new_status = 'finished' THEN
+    UPDATE public.revenues
+    SET status = 'available',
+        available_at = COALESCE(available_at, NOW()),
+        updated_at = NOW()
+    WHERE order_id = p_order_id AND status IN ('pending','available');
   END IF;
 
   -- Réversion revenus si cancel/dispute après completion/finished
