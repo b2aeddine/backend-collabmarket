@@ -115,6 +115,7 @@ serve(async (req) => {
         amount: Math.round(amount * 100),
         currency: "eur",
         destination: profile.stripe_account_id,
+        transfer_group: withdrawalId, // Link for reconciliation
         metadata: {
           withdrawal_id: withdrawalId,
           user_id: user.id,

@@ -56,7 +56,10 @@ serve(async (req) => {
     }
 
     // Vérification Permissions
-    if (order.merchant_id !== user.id && order.influencer_id !== user.id) {
+    const { data: adminCheck } = await supabaseClient.rpc("is_admin");
+    const isAdmin = adminCheck === true;
+
+    if (order.merchant_id !== user.id && order.influencer_id !== user.id && !isAdmin) {
       throw new Error("Unauthorized: You are not a participant of this order");
     }
 

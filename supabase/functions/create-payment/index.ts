@@ -34,7 +34,7 @@ serve(async (req) => {
   try {
     const body = await req.json();
     const authHeader = req.headers.get("Authorization");
-    
+
     if (!authHeader) throw new Error("Missing Authorization Header");
 
     // Validation des entrées
@@ -144,6 +144,7 @@ ${specialInstructions || "Aucune."}
         merchant_id: user.id,
         influencer_id: influencerId,
       },
+      transfer_group: order.id, // Link for reconciliation
     });
 
     // Mise à jour de la commande avec l'ID Stripe
