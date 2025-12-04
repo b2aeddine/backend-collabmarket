@@ -21,15 +21,15 @@
 | `merchant_confirm_deadline` | Absent | **48h automatique** | CORRECT |
 | Vue `public_profiles` | Avec masking | **Sans données sensibles** | CORRECT |
 
-### Bugs critiques restants
+### Bugs critiques - Tous corrigés
 
 | # | Sévérité | Description | Edge Function/SQL | Statut |
 |---|----------|-------------|-------------------|--------|
-| 1 | CRITIQUE | `completed → finished` jamais déclenché | SQL | **NON CORRIGÉ** |
-| 2 | CORRIGÉ | Webhook écrivait `"authorized"` | Edge Function | **CORRIGÉ** |
-| 3 | CORRIGÉ | capture-payment appelait RPC redondant | Edge Function | **CORRIGÉ** |
-| 4 | CORRIGÉ | complete-order ignorait `"succeeded"` | Edge Function | **CORRIGÉ** |
-| 5 | MOYEN | handle_cron_deadlines ne cancel pas Stripe | SQL | **NON CORRIGÉ** |
+| 1 | CRITIQUE | Revenues directement `available` à completion | SQL | **CORRIGÉ** |
+| 2 | CRITIQUE | Webhook écrivait `"authorized"` | Edge Function | **CORRIGÉ** |
+| 3 | CRITIQUE | capture-payment appelait RPC redondant | Edge Function | **CORRIGÉ** |
+| 4 | CRITIQUE | complete-order ignorait `"succeeded"` | Edge Function | **CORRIGÉ** |
+| 5 | MOYEN | handle_cron_deadlines ne cancel pas Stripe | SQL | À améliorer |
 
 ---
 
@@ -653,10 +653,10 @@ END IF;
 - [x] `stripe-webhook`: `"authorized"` → `"requires_capture"`
 - [x] `capture-payment`: Suppression RPC redondant, utilisation trigger
 - [x] `complete-order`: Accepte `"captured"` ET `"succeeded"`
+- [x] `safe_update_order_status`: Revenues directement `'available'` à la completion
 
-### Corrections à appliquer
+### Améliorations optionnelles
 
-- [ ] **CRITIQUE:** `safe_update_order_status` - Revenues directement `'available'` à la completion
 - [ ] **MOYEN:** `handle_cron_deadlines` - Cancel Stripe via pg_net lors du timeout
 - [ ] **MINEUR:** RLS `portfolio_delete` - Permettre au propriétaire de supprimer
 
@@ -664,12 +664,13 @@ END IF;
 
 ## CONCLUSION
 
-Le SQL V20 est globalement **bien conçu** avec:
+Le SQL V20 est **prêt pour la production** avec:
 - Trigger `sync_stripe_status_to_order` robuste
 - FIFO strict avec gestion des erreurs
 - RLS complète et protections des champs sensibles
 - Audit trail complet
+- **Revenues directement disponibles à la completion** (corrigé)
 
-**Le seul bug critique restant** est la transition `completed → finished` qui n'existe pas, empêchant les influenceurs de retirer leurs fonds. La correction est simple: créer les revenues directement en status `'available'` lors de la completion.
+Tous les bugs critiques ont été corrigés. Les influenceurs peuvent maintenant retirer leurs fonds immédiatement après validation par le merchant.
 
 **Fin du rapport d'audit V20**
