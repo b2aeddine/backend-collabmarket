@@ -1,6 +1,6 @@
 // ==============================================================================
-// SHARED UTILITIES - V14.0
-// Fichier à placer dans: supabase/functions/_shared/utils.ts
+// SHARED UTILITIES - V20.0
+// Emplacement partagé pour les Edge Functions (import: ../shared/utils/index.ts)
 // ==============================================================================
 
 import Stripe from "https://esm.sh/stripe@14.21.0";
