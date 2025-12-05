@@ -1,51 +1,82 @@
-# Workflow Paiement & Escrow (V20)
+# WORKFLOW MÉTIER & ESCROW
 
-## Vue d'ensemble
-- **Paiement autorisé uniquement** lors de la création de commande (`capture_method=manual`).
-- **Capture différée** via acceptation de l'influenceur (trigger Stripe → DB → transition automatique).
-- **Disponibilité des revenus** dès la confirmation marchand (`completed` → revenue `available`).
-- **Litiges** gérés via `safe_update_order_status` et la réversion conditionnelle des revenus.
+## 1. Vue d'ensemble
+Le système repose sur un modèle de **Marketplace Escrow** (Tiers de confiance).
+L'argent du commerçant est sécurisé par Stripe et n'est versé à l'influenceur qu'une fois la prestation validée.
 
-## Diagramme des flux de paiement
+## 2. Diagramme des Flux de Paiement
+
 ```mermaid
-flowchart TD
-  A[Merchant crée commande
-  create-payment
-  PI manual] --> B{payment_intent.amount_capturable_updated}
-  B -->|stripe-webhook| C[orders.stripe_payment_status
-  = requires_capture]
-  C --> D[Influenceur accepte via
-  capture-payment]
-  D --> E[orders.stripe_payment_status
-  = captured
-  trigger -> status=accepted]
-  E --> F[Influenceur livre
-  submitted/review_pending]
-  F --> G[Merchant confirme
-  safe_update_order_status(completed)]
-  G --> H[revenues.status=available
-  available_at=now]
-  H --> I[Influenceur déclenche withdrawal
-  process-withdrawal]
+sequenceDiagram
+    participant Merchant
+    participant Backend
+    participant Stripe
+    participant Influencer
+
+    Note over Merchant, Stripe: 1. CRÉATION & AUTHORIZATION
+    Merchant->>Backend: Création Commande (create-payment)
+    Backend->>Stripe: Create PaymentIntent (capture_method: manual)
+    Stripe-->>Backend: client_secret
+    Backend-->>Merchant: client_secret
+    Merchant->>Stripe: Confirmation Paiement (Frontend)
+    Stripe-->>Backend: Webhook (amount_capturable_updated)
+    Backend->>Backend: Order Status -> payment_authorized
+
+    Note over Influencer, Stripe: 2. ACCEPTATION (CAPTURE)
+    Influencer->>Backend: Accepter Commande (capture-payment)
+    Backend->>Stripe: Capture PaymentIntent
+    Stripe-->>Backend: Success
+    Backend->>Backend: Order Status -> accepted
+
+    Note over Influencer, Merchant: 3. RÉALISATION
+    Influencer->>Backend: Soumettre Livraison (submit_delivery)
+    Backend->>Backend: Order Status -> submitted
+    Backend->>Merchant: Notification
+
+    Note over Merchant, Influencer: 4. VALIDATION & LIBÉRATION
+    Merchant->>Backend: Valider (safe_update_order_status)
+    Backend->>Backend: Order Status -> completed
+    Backend->>Backend: Création Revenue (Status: available)
+
+    Note over Influencer, Stripe: 5. RETRAIT (PAYOUT)
+    Influencer->>Backend: Demande Retrait (request_withdrawal)
+    Backend->>Backend: Withdrawal Status -> pending
+    Backend->>Stripe: Cron Job -> Transfer + Payout
+    Stripe-->>Backend: Webhook (payout.paid)
+    Backend->>Backend: Withdrawal Status -> completed
+    Backend->>Backend: Revenue Status -> withdrawn (Atomic RPC)
 ```
 
-## Transitions d'état métier
-```mermaid
-stateDiagram-v2
-  [*] --> pending
-  pending --> accepted: Stripe capture (trigger)
-  accepted --> submitted
-  submitted --> review_pending
-  review_pending --> in_progress
-  in_progress --> completed: Merchant confirme
-  completed --> finished: Admin validation litige
-  completed --> cancelled: Admin/merchant
-  accepted --> cancelled: Admin/influenceur
-  cancelled --> [*]
-```
+## 3. Transitions de Statuts (Orders)
 
-## Rappels clés
-- **Autorisation Stripe** : `create-payment` crée un PaymentIntent en `manual` pour empêcher toute capture automatique.
-- **Capture conditionnelle** : seul `capture-payment` met `stripe_payment_status=captured`, le trigger `sync_stripe_status_to_order` force `status=accepted`.
-- **Revenus disponibles** : `safe_update_order_status` insère un revenue `available` + `available_at` au passage `completed` (auto-validation marchand ou timeout géré côté cron).
-- **Réversion** : en `cancelled/disputed` après completion, suppression des revenues si non `withdrawn`, sinon log critique.
+| Statut | Description | Transition Autorisée Vers |
+| :--- | :--- | :--- |
+| `pending` | Commande créée, en attente de paiement | `payment_authorized`, `cancelled` |
+| `payment_authorized` | Paiement bloqué (Auth), en attente acceptation | `accepted`, `cancelled` |
+| `accepted` | Influenceur a accepté, argent capturé | `in_progress`, `cancelled` |
+| `in_progress` | Prestation en cours | `submitted`, `cancelled` |
+| `submitted` | Livraison effectuée, en attente validation | `review_pending`, `completed`, `disputed` |
+| `review_pending` | Commerçant demande modifications | `submitted`, `disputed` |
+| `completed` | Validé par commerçant, fonds libérés | `finished`, `disputed` (rare) |
+| `finished` | Litige résolu ou archivé | - |
+| `cancelled` | Annulé (remboursement ou void auth) | - |
+| `disputed` | Litige ouvert | `finished` (validé), `cancelled` (remboursé) |
+
+## 4. Mécanisme Escrow (Sécurité Financière)
+
+### A. Authorization (Blocage des fonds)
+Au moment de la commande, les fonds ne sont **PAS** débités définitivement. Une empreinte bancaire (Authorization) est créée.
+- Si l'influenceur refuse ou ne répond pas sous 48h : L'empreinte est annulée (Void). Le client n'est pas débité.
+- Si l'influenceur accepte : L'empreinte est **Capturée**. L'argent arrive sur le compte Stripe de la plateforme.
+
+### B. Séquestre (Holding)
+Les fonds restent sur le compte plateforme tant que la commande n'est pas `completed`.
+L'influenceur voit un revenu "En attente".
+
+### C. Libération (Release)
+Dès que le commerçant valide la livraison (`completed`), une ligne de `revenues` est créée avec le statut `available`.
+L'influenceur peut alors demander un virement.
+
+### D. Retrait (Payout)
+Le retrait déclenche un `Transfer` (Plateforme -> Compte Connect Influenceur) suivi immédiatement d'un `Payout` (Compte Connect -> Compte Bancaire).
+Cela garantit que la plateforme garde le contrôle des fonds jusqu'au bout.

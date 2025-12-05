@@ -1,26 +1,30 @@
-# Sécurité & RLS (V20)
+# SÉCURITÉ BACKEND
 
-## Secrets & configuration
-- `get_encryption_key()` exige `app.encryption_key` >= 32 chars et retire l'exécution publique. 【F:marketplace_v20_full.sql†L28-L45】
-- `is_service_role()` détecte l'usage service_role via `request.jwt.claims` ou postgres. 【F:marketplace_v20_full.sql†L56-L70】
-- Variables Stripe/Supabase requises côté Edge Functions (voir `shared/utils/index.ts`). 【F:shared/utils/index.ts†L20-L46】
+## 1. Row Level Security (RLS)
+Toutes les tables sont protégées par RLS. Le principe de "moindre privilège" est appliqué.
 
-## Chiffrement données sensibles
-- `profiles` stocke email/phone en colonnes `*_encrypted` et impose contraintes de longueur. 【F:marketplace_v20_full.sql†L76-L109】
+### Règles Principales :
+- **Profiles** : Lecture publique (via vue `public_profiles`), Modification par soi-même uniquement.
+- **Orders** : Visibles seulement par le `merchant_id` et l'`influencer_id` concernés.
+- **Revenues/Withdrawals** : Visibles seulement par le propriétaire (`influencer_id`).
+- **Admin** : Accès total via la fonction `is_admin()`.
 
-## RLS & accès
-- RLS activé sur tables sensibles (`profiles`, `payment_logs`, `contact_messages`, etc.). 【F:marketplace_v20_full.sql†L2340-L2345】
-- Profils: sélection/MAJ limitée au propriétaire ou admin; insert restreint à `auth.uid()`. 【F:marketplace_v20_full.sql†L2348-L2365】
-- `payment_logs` : accès complet réservé aux admins. 【F:marketplace_v20_full.sql†L2367-L2372】
-- `contact_messages` : insert ouvert, lecture seulement admin. 【F:marketplace_v20_full.sql†L2374-L2385】
-- `categories` : lecture publique uniquement si `is_active`; admin full access. 【F:marketplace_v20_full.sql†L2387-L2395】
+## 2. Protection des Données Sensibles
+- **Emails & Téléphones** : Stockés chiffrés (`pgp_sym_encrypt`) dans la table `profiles`.
+  - Seul l'utilisateur concerné ou un admin peut les déchiffrer via les fonctions `mask_email` / `mask_phone`.
+  - La clé de chiffrement est stockée dans `app.encryption_key` (Vault Supabase).
 
-## Usage contrôlé du service_role
-- `capture-payment` utilise un client service_role uniquement pour pousser `stripe_payment_status=captured` avant que le trigger ne passe la commande en `accepted`. 【F:supabase/functions/capture-payment/index.ts†L92-L125】
-- `create-payment` mixe client utilisateur (RLS) et admin (service_role) pour les logs sans exposer la clé dans les réponses HTTP. 【F:supabase/functions/create-payment/index.ts†L120-L179】
-- Webhook Stripe validé par signature et journalisé avant traitement pour éviter la double-exécution. 【F:supabase/functions/stripe-webhook/index.ts†L62-L137】
+## 3. Sécurité des Paiements (Anti-Double Spending)
+- **Atomicité** : Les retraits utilisent une procédure RPC atomique `confirm_withdrawal_success`.
+- **Verrouillage** : Utilisation de `FOR UPDATE` lors de la manipulation des soldes pour éviter les Race Conditions.
+- **Idempotence** : Tous les webhooks Stripe vérifient l'ID de l'événement (`payment_logs`) avant traitement.
 
-## Intégrité financière
-- `safe_update_order_status` applique rate limit, vérifie rôle (merchant/influencer/admin) puis transitions autorisées via `validate_order_status_transition`. 【F:marketplace_v20_full.sql†L1070-L1117】
-- Passage `completed` crée un revenue immédiatement `available` et met à jour les stats influenceur. 【F:marketplace_v20_full.sql†L1145-L1167】
-- Annulation/litige post-completion supprime les revenues non retirés ou loggue un incident critique si déjà `withdrawn`. 【F:marketplace_v20_full.sql†L1180-L1199】
+## 4. Edge Functions
+- **Service Role** : Utilisé uniquement lorsque nécessaire (ex: écriture de logs système, mises à jour de statuts protégés).
+- **Validation** : Toutes les entrées (body, params) sont validées (Zod ou vérifications manuelles) avant traitement.
+- **CORS** : En-têtes stricts limités au domaine de production.
+
+## 5. Bonnes Pratiques
+- Ne jamais exposer `service_role_key` côté client.
+- Toujours utiliser les RPC pour les opérations complexes (changements de statut commande, retraits).
+- Ne jamais faire confiance aux métadonnées Stripe sans vérification croisée avec la DB.

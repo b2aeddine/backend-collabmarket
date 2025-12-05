@@ -1,7 +1,8 @@
 // ==============================================================================
-// STRIPE-WITHDRAWAL-WEBHOOK - V15.0 (SECURITY HARDENED)
+// STRIPE-WITHDRAWAL-WEBHOOK - V21.0 (ATOMIC RPC)
 // Gère les webhooks Stripe Connect pour les payouts
 // SECURITY: Signature obligatoire + Idempotence + CORS restrictif
+// FIX: Utilise confirm_withdrawal_success pour éviter le double spending
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -145,20 +146,17 @@ serve(async (req) => {
 
           console.log(`[Webhook] Payout completed for withdrawal: ${withdrawal.id}`);
 
-          await supabase
-            .from("withdrawals")
-            .update({
-              status: "completed",
-              processed_at: new Date().toISOString(),
-            })
-            .eq("id", withdrawal.id);
-
-          await supabase.rpc("finalize_revenue_withdrawal", {
-            p_influencer_id: withdrawal.influencer_id,
-            p_amount: withdrawal.amount,
+          // ATOMIC RPC CALL
+          const { error: rpcError } = await supabase.rpc("confirm_withdrawal_success", {
+            p_withdrawal_id: withdrawal.id
           });
 
-          console.log(`[Webhook] Withdrawal ${withdrawal.id} completed, revenues marked as withdrawn.`);
+          if (rpcError) {
+            console.error("CRITICAL: Failed to confirm withdrawal success:", rpcError);
+            throw new Error("RPC confirm_withdrawal_success failed");
+          }
+
+          console.log(`[Webhook] Withdrawal ${withdrawal.id} confirmed via Atomic RPC.`);
         }
         break;
       }
@@ -186,7 +184,6 @@ serve(async (req) => {
         }
 
         if (withdrawal) {
-          // IDEMPOTENCE: Vérifier si déjà traité
           if (withdrawal.status === "failed") {
             console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} already failed, skipping.`);
             break;
@@ -194,20 +191,13 @@ serve(async (req) => {
 
           console.log(`[Webhook] Payout failed for withdrawal: ${withdrawal.id}`);
 
-          await supabase
-            .from("withdrawals")
-            .update({
-              status: "failed",
-              failure_reason: failureMessage,
-            })
-            .eq("id", withdrawal.id);
-
-          await supabase.rpc("revert_revenue_withdrawal", {
-            p_influencer_id: withdrawal.influencer_id,
-            p_amount: withdrawal.amount,
+          // ATOMIC RPC CALL
+          await supabase.rpc("confirm_withdrawal_failure", {
+            p_withdrawal_id: withdrawal.id,
+            p_reason: failureMessage
           });
 
-          console.log(`[Webhook] Withdrawal ${withdrawal.id} failed, revenues reverted.`);
+          console.log(`[Webhook] Withdrawal ${withdrawal.id} marked as failed via Atomic RPC.`);
         }
         break;
       }
@@ -222,23 +212,14 @@ serve(async (req) => {
           .single();
 
         if (withdrawal) {
-          // IDEMPOTENCE: Vérifier si déjà traité
           if (withdrawal.status === "failed" || withdrawal.status === "cancelled") {
             console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} already cancelled/failed, skipping.`);
             break;
           }
 
-          await supabase
-            .from("withdrawals")
-            .update({
-              status: "failed",
-              failure_reason: "Payout was canceled",
-            })
-            .eq("id", withdrawal.id);
-
-          await supabase.rpc("revert_revenue_withdrawal", {
-            p_influencer_id: withdrawal.influencer_id,
-            p_amount: withdrawal.amount,
+          await supabase.rpc("confirm_withdrawal_failure", {
+            p_withdrawal_id: withdrawal.id,
+            p_reason: "Payout was canceled"
           });
         }
         break;
