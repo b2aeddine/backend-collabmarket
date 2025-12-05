@@ -1,4 +1,4 @@
-# CollabMarket - Backend V14.0 (CORRECTED)
+# CollabMarket - Backend V20.0 (PRODUCTION-GRADE)
 
 ## 📋 Vue d'ensemble
 
@@ -54,7 +54,7 @@ Marketplace d'influenceurs avec :
 ```
 corrected-project/
 ├── _shared/
-│   └── utils.ts              # Utilitaires partagés
+│   └── utils.ts              # Utilitaires partagés (déplacé vers shared/utils)
 ├── database-v14.0.sql        # Script SQL complet
 ├── auto-handle-orders/       # Cron: gestion deadlines
 ├── cancel-order-and-refund/  # Annulation + remboursement
@@ -82,6 +82,12 @@ corrected-project/
 ├── sync-revenues-with-stripe/
 ├── update-stripe-account-details/
 └── create-stripe-session/    # Checkout Session
+
+## 📚 Documentation additionnelle
+
+- `workflow.md` : flux complet paiement/escrow et transitions d'état.
+- `security.md` : contrôle RLS, gestion des secrets et règles d'accès service_role.
+- `stripe.md` : catalogue des appels Stripe (PaymentIntent, webhooks, transferts Connect).
 ```
 
 ---
