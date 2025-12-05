@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS public.collabmarket_listings (
   client_discount_rate DECIMAL(5,2) DEFAULT 0 CHECK (client_discount_rate >= 0 AND client_discount_rate <= 50),
   agent_commission_rate DECIMAL(5,2) NOT NULL CHECK (agent_commission_rate >= 0 AND agent_commission_rate <= 50),
   platform_fee_rate DECIMAL(5,2) NOT NULL DEFAULT 5.0 CHECK (platform_fee_rate >= 0 AND platform_fee_rate <= 20),
-  platform_cut_on_agent_rate DECIMAL(5,2) NOT NULL DEFAULT 20.0 CHECK (platform_cut_on_agent_rate >= 0 AND platform_cut_on_agent_rate <= 100),
+  platform_cut_on_agent_rate DECIMAL(5,2) NOT NULL DEFAULT 20.0 CHECK (platform_cut_on_agent_rate >= 0 AND platform_cut_on_agent_rate <= 50),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
