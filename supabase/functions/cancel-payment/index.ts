@@ -1,122 +1,107 @@
-// ==============================================================================
-// CANCEL-PAYMENT - V14.0 (CORRECTED)
-// Annule un paiement autorisé (libère les fonds bloqués)
-// ==============================================================================
-
-import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
-import Stripe from "https://esm.sh/stripe@14.21.0";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import Stripe from "https://esm.sh/stripe@14.21.0?target=deno";
+import { corsHeaders } from "../shared/utils/cors.ts";
 
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") as string, {
+  apiVersion: "2023-10-16",
+  httpClient: Stripe.createFetchHttpClient(),
+});
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    const { orderId, reason } = await req.json();
-    const authHeader = req.headers.get("Authorization");
-
-    if (!authHeader) {
-      throw new Error("Missing Authorization Header");
-    }
-
-    if (!orderId) {
-      throw new Error("Missing orderId");
-    }
-
-    console.log(`[Cancel Payment] Order: ${orderId}, Reason: ${reason || "not specified"}`);
-
-    // Init Supabase avec Contexte Utilisateur
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_ANON_KEY") ?? "",
-      { global: { headers: { Authorization: authHeader } } }
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Vérification de l'utilisateur connecté
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    // 1. AUTHENTICATION
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) throw new Error("Missing Authorization Header");
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser(authHeader.replace("Bearer ", ""));
     if (authError || !user) throw new Error("Unauthorized");
 
-    // Récupération de la commande
+    const { order_id, reason } = await req.json();
+    if (!order_id) throw new Error("Missing order_id");
+
+    // 2. FETCH ORDER
     const { data: order, error: orderError } = await supabase
       .from("orders")
-      .select("id, merchant_id, influencer_id, status, stripe_payment_intent_id")
-      .eq("id", orderId)
+      .select("*")
+      .eq("id", order_id)
       .single();
 
-    if (orderError || !order) {
-      throw new Error("Order not found");
+    if (orderError || !order) throw new Error("Order not found");
+
+    // 3. SECURITY & STATE CHECKS
+    // Who can cancel?
+    // - Merchant (Buyer) if status is 'submitted' or 'payment_authorized' (before acceptance)
+    // - Influencer (Seller) if status is 'payment_authorized' (Refusal)
+    // - Admin (Anytime)
+
+    const isBuyer = order.merchant_id === user.id;
+    const isSeller = order.influencer_id === user.id;
+    // const isAdmin = ... (check via RPC or claims)
+
+    if (!isBuyer && !isSeller) {
+      // Check if admin? For now assume strict role check.
+      throw new Error("Unauthorized: Only buyer or seller can cancel.");
     }
 
-    // Vérification des Droits
-    if (order.merchant_id !== user.id && order.influencer_id !== user.id) {
-      throw new Error("Unauthorized: You are not a participant of this order");
+    if (order.status !== "payment_authorized" && order.status !== "submitted") {
+      throw new Error(`Cannot cancel order in state '${order.status}'. Only 'payment_authorized' or 'submitted' orders can be cancelled via this endpoint.`);
     }
 
-    // Vérification du Statut
-    if (!["pending", "payment_authorized"].includes(order.status)) {
-      throw new Error(`Cannot cancel payment for order with status: ${order.status}. Use refund instead.`);
+    if (!order.stripe_payment_intent_id) {
+      throw new Error("Missing Stripe Payment Intent ID");
     }
 
-    // Annulation Stripe
-    const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
-      apiVersion: "2023-10-16",
-      httpClient: Stripe.createFetchHttpClient(),
+    // 4. STRIPE CANCEL (RELEASE AUTH)
+    console.log(`[Cancel] Cancelling payment intent ${order.stripe_payment_intent_id} for order ${order_id}`);
+
+    const paymentIntent = await stripe.paymentIntents.cancel(order.stripe_payment_intent_id, {
+      cancellation_reason: reason || (isSeller ? "abandoned" : "requested_by_customer"),
     });
 
-    if (order.stripe_payment_intent_id) {
-      try {
-        const pi = await stripe.paymentIntents.retrieve(order.stripe_payment_intent_id);
-
-        if (pi.status === "requires_capture" || pi.status === "requires_payment_method") {
-          await stripe.paymentIntents.cancel(order.stripe_payment_intent_id, {
-            cancellation_reason: reason === "refused_by_influencer" ? "abandoned" : "requested_by_customer",
-          });
-          console.log(`Stripe PI ${order.stripe_payment_intent_id} cancelled.`);
-        } else if (pi.status !== "canceled") {
-          console.log(`Stripe PI status is ${pi.status}, skipping cancellation.`);
-        }
-      } catch (stripeError) {
-        console.error("Stripe Error:", stripeError);
-        // Continue pour mettre à jour la DB
-      }
+    if (paymentIntent.status !== "canceled") {
+      throw new Error(`Stripe Cancel Failed: Status is ${paymentIntent.status}`);
     }
 
-    // Mise à jour DB via RPC
-    const { error: rpcError } = await supabase.rpc("safe_update_order_status", {
-      p_order_id: orderId,
-      p_new_status: "cancelled",
+    // 5. UPDATE ORDER STATUS
+    const { error: updateError } = await supabase
+      .from("orders")
+      .update({
+        status: "cancelled",
+        stripe_payment_status: "canceled",
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", order_id);
+
+    if (updateError) throw updateError;
+
+    // 6. LOG AUDIT
+    await supabase.from("audit_logs").insert({
+      user_id: user.id,
+      event_name: "order_cancelled",
+      table_name: "orders",
+      record_id: order_id,
+      new_values: { status: "cancelled", stripe_status: "canceled", reason }
     });
 
-    if (rpcError) {
-      console.error("DB RPC Error:", rpcError);
-      throw new Error(`Failed to update order status: ${rpcError.message}`);
-    }
-
-    return new Response(JSON.stringify({
-      success: true,
-      message: "Payment released and order cancelled",
-      newStatus: "cancelled",
-    }), {
+    return new Response(JSON.stringify({ success: true, order_id }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       status: 200,
     });
 
-  } catch (error: unknown) {
-    const err = error as Error;
-    console.error("Error in cancel-payment:", err);
-    return new Response(JSON.stringify({
-      success: false,
-      error: err.message,
-    }), {
+  } catch (error) {
+    console.error(`Cancel Error: ${error.message}`);
+    return new Response(JSON.stringify({ error: error.message }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       status: 400,
     });

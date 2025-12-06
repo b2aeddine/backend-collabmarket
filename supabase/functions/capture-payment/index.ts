@@ -1,136 +1,102 @@
-// ==============================================================================
-// CAPTURE-PAYMENT - V14.0 (CORRECTED)
-// Capture le paiement quand l'influenceur accepte la commande
-// ==============================================================================
-
-import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
-import Stripe from "https://esm.sh/stripe@14.21.0";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import Stripe from "https://esm.sh/stripe@14.21.0?target=deno";
+import { corsHeaders } from "../shared/utils/cors.ts";
 
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") as string, {
+  apiVersion: "2023-10-16",
+  httpClient: Stripe.createFetchHttpClient(),
+});
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    const { orderId } = await req.json();
-    const authHeader = req.headers.get("Authorization");
-
-    if (!authHeader) throw new Error("Missing Authorization Header");
-    if (!orderId) throw new Error("Missing orderId");
-
-    console.log(`[Capture Payment] Processing order: ${orderId}`);
-
-    // Init Client Supabase (Contexte Utilisateur)
     const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-      { global: { headers: { Authorization: authHeader } } }
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
-    // Vérification Token
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    // 1. AUTHENTICATION (User must be logged in)
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) throw new Error("Missing Authorization Header");
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser(authHeader.replace("Bearer ", ""));
     if (authError || !user) throw new Error("Unauthorized");
 
-    // Récupération de la commande
+    const { order_id } = await req.json();
+    if (!order_id) throw new Error("Missing order_id");
+
+    // 2. FETCH ORDER & VALIDATE
     const { data: order, error: orderError } = await supabase
       .from("orders")
-      .select("id, status, influencer_id, stripe_payment_intent_id")
-      .eq("id", orderId)
+      .select("*")
+      .eq("id", order_id)
       .single();
 
     if (orderError || !order) throw new Error("Order not found");
 
-    // Seul l'influenceur assigné peut accepter
+    // 3. SECURITY CHECKS
+    // Only the Seller (Influencer) can accept/capture
     if (order.influencer_id !== user.id) {
-      throw new Error("Unauthorized: Only the assigned influencer can accept this order");
+      throw new Error("Unauthorized: Only the assigned influencer can accept this order.");
     }
 
-    // L'ordre doit être strictement 'payment_authorized'
+    // Strict Status Check
     if (order.status !== "payment_authorized") {
-      throw new Error(`Invalid status: cannot capture from status '${order.status}'`);
+      throw new Error(`Invalid status: Cannot capture order in state '${order.status}'. Must be 'payment_authorized'.`);
     }
 
     if (!order.stripe_payment_intent_id) {
-      throw new Error("Missing payment intent on order");
+      throw new Error("Missing Stripe Payment Intent ID");
     }
 
-    // Capture Stripe
-    const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
-      apiVersion: "2023-10-16",
-      httpClient: Stripe.createFetchHttpClient(),
-    });
+    // 4. STRIPE CAPTURE
+    console.log(`[Capture] Capturing payment for order ${order_id} (PI: ${order.stripe_payment_intent_id})`);
 
-    let intent;
-    try {
-      intent = await stripe.paymentIntents.capture(order.stripe_payment_intent_id);
-      console.log("Stripe capture successful:", intent.id);
-    } catch (err: unknown) {
-      const stripeErr = err as { code?: string };
-      // Gestion de l'idempotence
-      if (stripeErr.code === "payment_intent_unexpected_state") {
-        const pi = await stripe.paymentIntents.retrieve(order.stripe_payment_intent_id);
-        if (pi.status === "succeeded") {
-          console.log("Payment was already captured, proceeding.");
-          intent = pi;
-        } else {
-          throw err;
-        }
-      } else {
-        throw err;
-      }
+    const paymentIntent = await stripe.paymentIntents.capture(order.stripe_payment_intent_id);
+
+    if (paymentIntent.status !== "succeeded") {
+      throw new Error(`Stripe Capture Failed: Status is ${paymentIntent.status}`);
     }
 
-    // FIX V20: Utiliser le service role pour mettre stripe_payment_status
-    // Le trigger sync_stripe_status_to_order fera automatiquement la transition vers 'accepted'
-    // Plus besoin d'appeler safe_update_order_status (c'était redondant et échouait)
-    const supabaseAdmin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
+    // 5. UPDATE ORDER STATUS
+    // We update to 'accepted' or 'awaiting_delivery'. 
+    // The user workflow says: "L’influenceur a 48h pour accepter → si oui, Stripe capture le paiement"
+    // So status should be 'accepted' (or 'in_progress' / 'awaiting_delivery').
+    // Let's use 'awaiting_delivery' as per plan.
 
-    const { error: updateError } = await supabaseAdmin
+    const { error: updateError } = await supabase
       .from("orders")
       .update({
-        stripe_payment_status: "captured",
-        captured_at: new Date().toISOString(),
+        status: "awaiting_delivery",
+        stripe_payment_status: "captured", // Sync immediately, webhook will confirm
+        accepted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
       })
-      .eq("id", orderId);
+      .eq("id", order_id);
 
-    if (updateError) {
-      console.error("CRITICAL: Payment captured BUT DB update failed", updateError);
-      throw new Error("Payment captured but order status update failed");
-    }
+    if (updateError) throw updateError;
 
-    // Le trigger sync_stripe_status_to_order a automatiquement:
-    // 1. Mis status = 'accepted'
-    // 2. Mis accepted_at = NOW()
-    console.log(`Order ${orderId} automatically transitioned to 'accepted' via trigger`);
+    // 6. LOG AUDIT
+    await supabase.from("audit_logs").insert({
+      user_id: user.id,
+      event_name: "order_accepted_captured",
+      table_name: "orders",
+      record_id: order_id,
+      new_values: { status: "awaiting_delivery", stripe_status: "captured" }
+    });
 
-    return new Response(JSON.stringify({
-      success: true,
-      status: "accepted",
-      paymentIntentId: intent.id,
-    }), {
+    return new Response(JSON.stringify({ success: true, order_id }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       status: 200,
     });
 
-  } catch (error: unknown) {
-    const err = error as Error;
-    console.error("Error in capture-payment:", err);
-    return new Response(JSON.stringify({
-      success: false,
-      error: err.message,
-    }), {
+  } catch (error) {
+    console.error(`Capture Error: ${error.message}`);
+    return new Response(JSON.stringify({ error: error.message }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
       status: 400,
     });
