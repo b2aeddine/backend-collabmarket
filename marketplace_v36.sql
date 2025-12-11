@@ -842,68 +842,189 @@ LANGUAGE plpgsql
 SECURITY DEFINER AS $$
 DECLARE
   v_transaction_group_id UUID;
+  v_order RECORD;
   v_seller_rev RECORD;
   v_agent_rev RECORD;
-  v_plat_rev  RECORD;
+  v_plat_rev RECORD;
+  v_ratio DECIMAL;
+  v_is_full_refund BOOLEAN;
+  v_seller_refund DECIMAL := 0;
+  v_agent_refund DECIMAL := 0;
+  v_platform_refund DECIMAL := 0;
+  v_total_already_refunded DECIMAL := 0;
+  v_refund_status TEXT;
 BEGIN
+  -- Idempotency: check if this specific refund was already processed
   IF EXISTS (SELECT 1 FROM public.reverse_runs WHERE order_id = p_order_id AND refund_id = p_refund_id) THEN
     RETURN jsonb_build_object('success', true, 'message', 'Already reversed');
   END IF;
 
+  -- Get order details
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id;
+  IF v_order IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_FOUND');
+  END IF;
+
+  -- Validate refund amount
+  IF p_refund_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_REFUND_AMOUNT');
+  END IF;
+
+  -- Calculate total already refunded for this order
+  SELECT COALESCE(SUM(amount), 0) INTO v_total_already_refunded
+  FROM public.reverse_runs
+  WHERE order_id = p_order_id AND completed = TRUE;
+
+  -- Check if new refund would exceed order total
+  IF (v_total_already_refunded + p_refund_amount) > v_order.total_amount THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'REFUND_EXCEEDS_ORDER_TOTAL',
+      'max_refundable', v_order.total_amount - v_total_already_refunded
+    );
+  END IF;
+
+  -- Determine if this is a full refund (cumulative)
+  v_is_full_refund := (v_total_already_refunded + p_refund_amount) >= v_order.total_amount;
+
+  -- Calculate refund ratio based on THIS refund amount
+  v_ratio := p_refund_amount / v_order.total_amount;
+
+  -- Register the refund run
   INSERT INTO public.reverse_runs(order_id, refund_id, run_started_at, amount)
   VALUES (p_order_id, p_refund_id, NOW(), p_refund_amount);
 
   v_transaction_group_id := gen_random_uuid();
 
-  SELECT * INTO v_seller_rev FROM public.seller_revenues WHERE order_id = p_order_id;
-  SELECT * INTO v_agent_rev  FROM public.agent_revenues  WHERE order_id = p_order_id;
-  SELECT * INTO v_plat_rev   FROM public.platform_revenues WHERE order_id = p_order_id;
+  -- Get current revenue records
+  SELECT * INTO v_seller_rev FROM public.seller_revenues WHERE order_id = p_order_id AND locked = FALSE;
+  SELECT * INTO v_agent_rev FROM public.agent_revenues WHERE order_id = p_order_id AND locked = FALSE;
+  SELECT * INTO v_plat_rev FROM public.platform_revenues WHERE order_id = p_order_id AND locked = FALSE;
 
-  IF v_seller_rev IS NOT NULL THEN
-    PERFORM public.record_ledger_entry(
-      v_transaction_group_id, p_order_id,
-      'user_wallet', v_seller_rev.seller_id, 'debit', v_seller_rev.amount,
-      'Refund Seller'
-    );
-    UPDATE public.seller_revenues
-    SET status = 'cancelled', locked = TRUE
-    WHERE order_id = p_order_id;
+  -- Process seller revenue
+  IF v_seller_rev IS NOT NULL AND v_seller_rev.amount > 0 THEN
+    IF v_is_full_refund THEN
+      -- Full refund: reverse entire remaining amount
+      v_seller_refund := v_seller_rev.amount;
+    ELSE
+      -- Partial refund: calculate pro-rata amount
+      v_seller_refund := LEAST(
+        ROUND(v_seller_rev.amount * v_ratio, 2),
+        v_seller_rev.amount
+      );
+    END IF;
+
+    IF v_seller_refund > 0 THEN
+      PERFORM public.record_ledger_entry(
+        v_transaction_group_id, p_order_id,
+        'user_wallet', v_seller_rev.seller_id, 'debit', v_seller_refund,
+        CASE WHEN v_is_full_refund THEN 'Full Refund - Seller' ELSE 'Partial Refund - Seller' END
+      );
+
+      IF v_is_full_refund OR v_seller_refund >= v_seller_rev.amount THEN
+        UPDATE public.seller_revenues
+        SET status = 'cancelled', locked = TRUE, updated_at = NOW()
+        WHERE id = v_seller_rev.id;
+      ELSE
+        UPDATE public.seller_revenues
+        SET amount = amount - v_seller_refund, updated_at = NOW()
+        WHERE id = v_seller_rev.id;
+      END IF;
+    END IF;
   END IF;
 
-  IF v_agent_rev IS NOT NULL THEN
-    PERFORM public.record_ledger_entry(
-      v_transaction_group_id, p_order_id,
-      'agent_commission', v_agent_rev.agent_id, 'debit', v_agent_rev.amount,
-      'Refund Agent'
-    );
-    UPDATE public.agent_revenues
-    SET status = 'cancelled', locked = TRUE
-    WHERE order_id = p_order_id;
+  -- Process agent revenue
+  IF v_agent_rev IS NOT NULL AND v_agent_rev.amount > 0 THEN
+    IF v_is_full_refund THEN
+      v_agent_refund := v_agent_rev.amount;
+    ELSE
+      v_agent_refund := LEAST(
+        ROUND(v_agent_rev.amount * v_ratio, 2),
+        v_agent_rev.amount
+      );
+    END IF;
+
+    IF v_agent_refund > 0 THEN
+      PERFORM public.record_ledger_entry(
+        v_transaction_group_id, p_order_id,
+        'agent_commission', v_agent_rev.agent_id, 'debit', v_agent_refund,
+        CASE WHEN v_is_full_refund THEN 'Full Refund - Agent' ELSE 'Partial Refund - Agent' END
+      );
+
+      IF v_is_full_refund OR v_agent_refund >= v_agent_rev.amount THEN
+        UPDATE public.agent_revenues
+        SET status = 'cancelled', locked = TRUE, updated_at = NOW()
+        WHERE id = v_agent_rev.id;
+      ELSE
+        UPDATE public.agent_revenues
+        SET amount = amount - v_agent_refund, updated_at = NOW()
+        WHERE id = v_agent_rev.id;
+      END IF;
+    END IF;
   END IF;
 
-  IF v_plat_rev IS NOT NULL THEN
-    PERFORM public.record_ledger_entry(
-      v_transaction_group_id, p_order_id,
-      'platform_fees', NULL, 'debit', v_plat_rev.amount,
-      'Refund Platform'
-    );
-    UPDATE public.platform_revenues
-    SET locked = TRUE
-    WHERE order_id = p_order_id;
+  -- Process platform revenue
+  IF v_plat_rev IS NOT NULL AND v_plat_rev.amount > 0 THEN
+    IF v_is_full_refund THEN
+      v_platform_refund := v_plat_rev.amount;
+    ELSE
+      v_platform_refund := LEAST(
+        ROUND(v_plat_rev.amount * v_ratio, 2),
+        v_plat_rev.amount
+      );
+    END IF;
+
+    IF v_platform_refund > 0 THEN
+      PERFORM public.record_ledger_entry(
+        v_transaction_group_id, p_order_id,
+        'platform_fees', NULL, 'debit', v_platform_refund,
+        CASE WHEN v_is_full_refund THEN 'Full Refund - Platform' ELSE 'Partial Refund - Platform' END
+      );
+
+      IF v_is_full_refund OR v_platform_refund >= v_plat_rev.amount THEN
+        UPDATE public.platform_revenues
+        SET locked = TRUE
+        WHERE id = v_plat_rev.id;
+      ELSE
+        UPDATE public.platform_revenues
+        SET amount = amount - v_platform_refund
+        WHERE id = v_plat_rev.id;
+      END IF;
+    END IF;
   END IF;
 
+  -- Determine refund status
+  IF v_is_full_refund THEN
+    v_refund_status := 'full';
+  ELSIF v_order.refund_status = 'partial' THEN
+    v_refund_status := 'partial'; -- Keep partial if already partial
+  ELSE
+    v_refund_status := 'partial';
+  END IF;
+
+  -- Update order
   UPDATE public.orders
-  SET refund_status = 'full',
-      refund_amount = p_refund_amount,
+  SET refund_status = v_refund_status,
+      refund_amount = COALESCE(refund_amount, 0) + p_refund_amount,
       refunded_at = NOW(),
-      status = 'cancelled'
+      status = CASE WHEN v_is_full_refund THEN 'cancelled' ELSE status END,
+      cancelled_at = CASE WHEN v_is_full_refund THEN NOW() ELSE cancelled_at END
   WHERE id = p_order_id;
 
+  -- Mark this refund run as completed
   UPDATE public.reverse_runs
   SET completed = TRUE, completed_at = NOW()
   WHERE order_id = p_order_id AND refund_id = p_refund_id;
 
-  RETURN jsonb_build_object('success', true);
+  RETURN jsonb_build_object(
+    'success', true,
+    'refund_type', CASE WHEN v_is_full_refund THEN 'full' ELSE 'partial' END,
+    'seller_refunded', v_seller_refund,
+    'agent_refunded', v_agent_refund,
+    'platform_refunded', v_platform_refund,
+    'total_refunded', v_total_already_refunded + p_refund_amount,
+    'order_total', v_order.total_amount
+  );
 END;
 $$;
 
@@ -1356,7 +1477,9 @@ GRANT SELECT ON TABLE public.gig_bundles TO anon, authenticated;
 GRANT SELECT ON TABLE public.gig_bundle_items TO anon, authenticated;
 
 -- Authenticated CRUD via RLS
-GRANT INSERT, UPDATE ON TABLE public.profiles TO authenticated;
+-- Users can read their own profile (RLS restricts to auth.uid() = id)
+-- For public profile viewing, use public.public_profiles view instead
+GRANT SELECT, INSERT, UPDATE ON TABLE public.profiles TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON TABLE public.gigs TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON TABLE public.gig_packages TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON TABLE public.gig_media TO authenticated;
