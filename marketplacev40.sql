@@ -1,6 +1,19 @@
 -- ============================================================================
--- COLLABMARKET V40.0 - PRODUCTION READY MULTI-ROLE SAAS EDITION
+-- COLLABMARKET V40.1 - PRODUCTION READY MULTI-ROLE SAAS EDITION
 -- ============================================================================
+-- [CHANGELOG V40.1]
+-- [FIX] reverse_commissions: support complet des remboursements partiels avec pro-rata
+--       - Calcul proportionnel des montants à reverser (seller, agent, platform)
+--       - Support des remboursements multiples sur une même commande
+--       - Vérification que le total remboursé ne dépasse pas le montant original
+--       - Mise à jour incrémentale de refund_amount au lieu d'écrasement
+--       - Nouveau statut 'partial_refund' pour affiliate_conversions
+-- [SEC] Vie privée profiles renforcée:
+--       - Suppression de GRANT SELECT ON profiles TO anon
+--       - Utilisateurs anonymes accèdent uniquement via v_profiles_public
+--       - Colonnes sensibles (email, phone, kyc_status, stripe_*) protégées
+--       - Policies RLS refactorisées pour authentifiés/admin/service_role
+--
 -- [CHANGELOG V40.0]
 -- [FIX] Colonne client_discount_rate ajoutée à affiliate_listings
 -- [FIX] Colonne acceptance_deadline ajoutée à orders
@@ -571,7 +584,7 @@ CREATE TABLE public.affiliate_conversions (
   seller_revenue DECIMAL(10,2) DEFAULT 0 CHECK (seller_revenue >= 0),
   agent_commission_rate DECIMAL(5,2),
   platform_cut_rate DECIMAL(5,2),
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'reversed')),
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'reversed', 'partial_refund')),
   confirmed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -1256,7 +1269,7 @@ BEGIN
 END;
 $$;
 
--- Reverse commissions (remboursement)
+-- Reverse commissions (remboursement) - Supporte remboursements partiels avec pro-rata
 CREATE OR REPLACE FUNCTION public.reverse_commissions(p_order_id UUID, p_refund_id TEXT, p_amount DECIMAL)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -1266,7 +1279,18 @@ DECLARE
   v_platform_rev public.platform_revenues%ROWTYPE;
   v_group UUID;
   v_refund_status TEXT := 'full';
+  v_refund_ratio DECIMAL;
+  v_seller_refund DECIMAL := 0;
+  v_agent_refund DECIMAL := 0;
+  v_platform_refund DECIMAL := 0;
+  v_total_previous_refunds DECIMAL := 0;
+  v_remaining_amount DECIMAL;
 BEGIN
+  -- Validation du montant
+  IF p_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_REFUND_AMOUNT');
+  END IF;
+
   -- Idempotence
   IF EXISTS(SELECT 1 FROM public.reverse_runs WHERE order_id = p_order_id AND refund_id = p_refund_id) THEN
     RETURN jsonb_build_object('success', true, 'message', 'Already reversed');
@@ -1276,51 +1300,118 @@ BEGIN
   IF v_order.id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_FOUND');
   END IF;
-  
-  -- Déterminer si remboursement partiel ou total
-  IF p_amount < v_order.total_amount THEN 
-    v_refund_status := 'partial'; 
+
+  -- Calculer les remboursements précédents pour cette commande
+  SELECT COALESCE(SUM(amount), 0) INTO v_total_previous_refunds
+  FROM public.reverse_runs
+  WHERE order_id = p_order_id AND completed = TRUE;
+
+  -- Vérifier qu'on ne rembourse pas plus que le montant restant
+  v_remaining_amount := v_order.total_amount - v_total_previous_refunds;
+  IF p_amount > v_remaining_amount THEN
+    RETURN jsonb_build_object('success', false, 'error', 'REFUND_EXCEEDS_REMAINING',
+      'remaining', v_remaining_amount, 'requested', p_amount);
   END IF;
+
+  -- Déterminer si remboursement partiel ou total
+  IF (v_total_previous_refunds + p_amount) < v_order.total_amount THEN
+    v_refund_status := 'partial';
+  END IF;
+
+  -- Calculer le ratio de remboursement (basé sur le montant total de la commande)
+  v_refund_ratio := p_amount / v_order.total_amount;
 
   INSERT INTO public.reverse_runs(order_id, refund_id, amount) VALUES (p_order_id, p_refund_id, p_amount);
   v_group := gen_random_uuid();
 
-  -- Reverser le revenu vendeur
+  -- Reverser le revenu vendeur (pro-rata)
   SELECT * INTO v_seller_rev FROM public.seller_revenues WHERE order_id = p_order_id;
   IF v_seller_rev.id IS NOT NULL AND v_seller_rev.amount > 0 THEN
-    UPDATE public.seller_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_seller_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_rev.seller_id, 'debit', v_seller_rev.amount, 'Refund reversal');
+    v_seller_refund := ROUND(v_seller_rev.amount * v_refund_ratio, 2);
+
+    IF v_refund_status = 'full' THEN
+      -- Remboursement complet: marquer comme reversed
+      UPDATE public.seller_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_seller_rev.id;
+    ELSE
+      -- Remboursement partiel: réduire le montant disponible
+      UPDATE public.seller_revenues SET
+        amount = amount - v_seller_refund,
+        updated_at = NOW()
+      WHERE id = v_seller_rev.id;
+    END IF;
+
+    IF v_seller_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_rev.seller_id, 'debit', v_seller_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
-  -- Reverser le revenu agent
+  -- Reverser le revenu agent (pro-rata)
   SELECT * INTO v_agent_rev FROM public.agent_revenues WHERE order_id = p_order_id;
   IF v_agent_rev.id IS NOT NULL AND v_agent_rev.amount > 0 THEN
-    UPDATE public.agent_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_agent_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_rev.agent_id, 'debit', v_agent_rev.amount, 'Refund reversal');
-    
-    -- Mettre à jour affiliate_conversions
-    UPDATE public.affiliate_conversions SET status = 'reversed' WHERE order_id = p_order_id;
+    v_agent_refund := ROUND(v_agent_rev.amount * v_refund_ratio, 2);
+
+    IF v_refund_status = 'full' THEN
+      UPDATE public.agent_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_agent_rev.id;
+      -- Marquer la conversion comme reversed
+      UPDATE public.affiliate_conversions SET status = 'reversed' WHERE order_id = p_order_id;
+    ELSE
+      UPDATE public.agent_revenues SET
+        amount = amount - v_agent_refund,
+        updated_at = NOW()
+      WHERE id = v_agent_rev.id;
+      -- Mettre à jour la conversion avec le montant réduit
+      UPDATE public.affiliate_conversions SET
+        agent_commission_net = agent_commission_net - v_agent_refund,
+        status = 'partial_refund'
+      WHERE order_id = p_order_id;
+    END IF;
+
+    IF v_agent_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_rev.agent_id, 'debit', v_agent_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
-  -- Reverser le revenu plateforme
+  -- Reverser le revenu plateforme (pro-rata)
   SELECT * INTO v_platform_rev FROM public.platform_revenues WHERE order_id = p_order_id;
   IF v_platform_rev.id IS NOT NULL AND v_platform_rev.amount > 0 THEN
-    UPDATE public.platform_revenues SET locked = TRUE WHERE id = v_platform_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'platform_revenue', NULL, 'debit', v_platform_rev.amount, 'Refund reversal');
+    v_platform_refund := ROUND(v_platform_rev.amount * v_refund_ratio, 2);
+
+    IF v_refund_status = 'full' THEN
+      UPDATE public.platform_revenues SET locked = TRUE WHERE id = v_platform_rev.id;
+    ELSE
+      UPDATE public.platform_revenues SET
+        amount = amount - v_platform_refund
+      WHERE id = v_platform_rev.id;
+    END IF;
+
+    IF v_platform_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'platform_revenue', NULL, 'debit', v_platform_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
   -- Mettre à jour la commande
-  UPDATE public.orders SET 
-    refund_status = v_refund_status, 
-    refund_amount = p_amount, 
+  UPDATE public.orders SET
+    refund_status = v_refund_status,
+    refund_amount = COALESCE(refund_amount, 0) + p_amount,
     refunded_at = NOW(),
-    status = 'refunded'
+    status = CASE WHEN v_refund_status = 'full' THEN 'refunded' ELSE status END
   WHERE id = p_order_id;
 
   -- Marquer comme complété
   UPDATE public.reverse_runs SET completed = TRUE, completed_at = NOW() WHERE order_id = p_order_id AND refund_id = p_refund_id;
 
-  RETURN jsonb_build_object('success', true, 'refund_status', v_refund_status);
+  RETURN jsonb_build_object(
+    'success', true,
+    'refund_status', v_refund_status,
+    'seller_refunded', v_seller_refund,
+    'agent_refunded', v_agent_refund,
+    'platform_refunded', v_platform_refund,
+    'total_refunded', v_total_previous_refunds + p_amount,
+    'remaining', v_order.total_amount - v_total_previous_refunds - p_amount
+  );
 END;
 $$;
 
@@ -1744,7 +1835,19 @@ ALTER TABLE public.processed_webhooks ENABLE ROW LEVEL SECURITY;
 -- ============================================================================
 
 -- PROFILES
-CREATE POLICY "profiles_public_read" ON public.profiles FOR SELECT USING (true);
+-- NOTE: Les utilisateurs anonymes accèdent aux profils publics via v_profiles_public uniquement
+-- La policy ci-dessous permet aux users authentifiés de lire les profils (filtré par deletion_requested_at)
+CREATE POLICY "profiles_authenticated_read" ON public.profiles FOR SELECT
+  USING (
+    deletion_requested_at IS NULL AND (
+      auth.uid() IS NOT NULL  -- Utilisateurs authentifiés peuvent voir les profils publics
+      OR public.is_service_role()  -- Service role a accès total
+    )
+  );
+CREATE POLICY "profiles_owner_full_read" ON public.profiles FOR SELECT
+  USING (auth.uid() = id);  -- Un user peut toujours lire son propre profil
+CREATE POLICY "profiles_admin_read" ON public.profiles FOR SELECT
+  USING (public.is_admin() OR public.is_service_role());  -- Admins ont accès total
 CREATE POLICY "profiles_owner_update" ON public.profiles FOR UPDATE USING (auth.uid() = id);
 CREATE POLICY "profiles_owner_insert" ON public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
 
@@ -2010,7 +2113,8 @@ GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
 
 -- SELECT pour anon (lecture publique limitée par RLS)
-GRANT SELECT ON public.profiles TO anon;
+-- NOTE: public.profiles n'est PAS accordé à anon - utiliser v_profiles_public à la place
+-- Cela empêche l'exposition des colonnes sensibles (email, phone, kyc_status, stripe_*, etc.)
 GRANT SELECT ON public.categories TO anon;
 GRANT SELECT ON public.services TO anon;
 GRANT SELECT ON public.service_packages TO anon;
@@ -2019,7 +2123,7 @@ GRANT SELECT ON public.service_faqs TO anon;
 GRANT SELECT ON public.reviews TO anon;
 GRANT SELECT ON public.global_offers TO anon;
 GRANT SELECT ON public.v_services_public TO anon;
-GRANT SELECT ON public.v_profiles_public TO anon;
+GRANT SELECT ON public.v_profiles_public TO anon;  -- Vue sécurisée avec colonnes filtrées
 
 -- Grants pour authenticated
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO authenticated;
