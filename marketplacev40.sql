@@ -11,6 +11,9 @@
 -- [FIX] services.slug: UNIQUE(seller_id, slug) au lieu de global (permet même slug cross-sellers)
 -- [FEAT] withdrawal_allocations: table pour verrouillage partiel des revenus
 -- [FEAT] request_withdrawal(): allocation FIFO des revenus (ne verrouille plus tout le solde)
+-- [FIX] apply_to_offer(): snapshot social_links utilisait sl.profile_url au lieu de sl.url
+-- [DOC] platform_fee: commentaires clarifiants (MONTANT, pas taux)
+-- [DOC] auto_complete_orders(): note sur protection idempotence via commission_runs
 --
 -- [CHANGELOG V40.4]
 -- [FIX] merchant_profiles: ajout colonne description (manquante pour v_merchant_public)
@@ -773,7 +776,7 @@ CREATE TABLE public.affiliate_conversions (
   agent_commission_gross DECIMAL(10,2) DEFAULT 0 CHECK (agent_commission_gross >= 0),
   platform_cut_on_agent DECIMAL(10,2) DEFAULT 0 CHECK (platform_cut_on_agent >= 0),
   agent_commission_net DECIMAL(10,2) DEFAULT 0 CHECK (agent_commission_net >= 0),
-  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),
+  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),  -- MONTANT total plateforme (pas un taux)
   seller_revenue DECIMAL(10,2) DEFAULT 0 CHECK (seller_revenue >= 0),
   agent_commission_rate DECIMAL(5,2),
   platform_cut_rate DECIMAL(5,2),
@@ -807,7 +810,7 @@ CREATE TABLE public.orders (
   -- Montants
   subtotal DECIMAL(10,2) NOT NULL CHECK (subtotal >= 0),
   discount_amount DECIMAL(10,2) DEFAULT 0 CHECK (discount_amount >= 0),
-  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),
+  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),  -- MONTANT (pas un taux), calculé par distribute_commissions()
   total_amount DECIMAL(10,2) NOT NULL CHECK (total_amount > 0),
   seller_revenue DECIMAL(10,2) CHECK (seller_revenue >= 0),
 
@@ -1862,7 +1865,7 @@ BEGIN
     'social_links', (SELECT jsonb_agg(jsonb_build_object(
       'platform', sl.platform,
       'username', sl.username,
-      'profile_url', sl.profile_url,
+      'profile_url', sl.url,
       'followers_count', sl.followers_count,
       'is_verified', sl.is_verified
     )) FROM public.social_links sl WHERE sl.user_id = v_user_id)
@@ -2169,6 +2172,7 @@ BEGIN
   WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours';
 
   -- Distribuer les commissions pour les commandes auto-complétées
+  -- NOTE: Double distribution impossible grâce à commission_runs (idempotence)
   PERFORM public.distribute_commissions(id)
   FROM public.orders
   WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute';
