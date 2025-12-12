@@ -1,6 +1,15 @@
 -- ============================================================================
--- COLLABMARKET V40.3 - PRODUCTION READY MULTI-ROLE SAAS EDITION
+-- COLLABMARKET V40.4 - PRODUCTION READY MULTI-ROLE SAAS EDITION
 -- ============================================================================
+-- [CHANGELOG V40.4]
+-- [FIX] merchant_profiles: ajout colonne description (manquante pour v_merchant_public)
+-- [FIX] agent_profiles: ajout colonnes marketing_channels, audience_description,
+--       experience_level (manquantes pour v_agent_public)
+-- [CONSTRAINT] orders.amounts_coherence: vérifie total = subtotal - discount + platform_fee
+-- [PERF] Index supplémentaires messages:
+--       - idx_messages_sender_time (sender_id, created_at DESC)
+--       - idx_messages_conversation_time (conversation_id, created_at DESC)
+--
 -- [CHANGELOG V40.3]
 -- [FIX] orders: ajout colonnes order_number (auto-généré) et seller_notes
 -- [FIX] influencer_profiles: ajout colonnes manquantes (content_types, platforms,
@@ -371,6 +380,7 @@ CREATE INDEX idx_influencer_audience_size ON public.influencer_profiles(audience
 CREATE TABLE public.merchant_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   company_name TEXT CHECK (LENGTH(company_name) <= 200),
+  description TEXT CHECK (LENGTH(description) <= 2000),  -- Description publique de l'entreprise
   vat_number TEXT CHECK (LENGTH(vat_number) <= 50),
   industry TEXT CHECK (LENGTH(industry) <= 100),
   company_size TEXT CHECK (company_size IN ('solo', 'small', 'medium', 'large', 'enterprise')),
@@ -383,6 +393,11 @@ CREATE TABLE public.merchant_profiles (
 CREATE TABLE public.agent_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   agency_name TEXT CHECK (LENGTH(agency_name) <= 200),
+  -- Infos publiques pour les agents affiliés
+  marketing_channels TEXT[] DEFAULT '{}',  -- Canaux de marketing: blog, youtube, social, email, etc.
+  audience_description TEXT CHECK (LENGTH(audience_description) <= 1000),  -- Description de l'audience cible
+  experience_level TEXT CHECK (experience_level IN ('beginner', 'intermediate', 'advanced', 'expert')),
+  -- Commission et stats
   commission_rate_default DECIMAL(5,2) DEFAULT 10.0 CHECK (commission_rate_default >= 0 AND commission_rate_default <= 50),
   total_generated_revenue DECIMAL(12,2) DEFAULT 0 CHECK (total_generated_revenue >= 0),
   total_conversions INTEGER DEFAULT 0 CHECK (total_conversions >= 0),
@@ -815,7 +830,11 @@ CREATE TABLE public.orders (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   
-  CONSTRAINT no_self_purchase CHECK (buyer_id <> seller_id)
+  CONSTRAINT no_self_purchase CHECK (buyer_id <> seller_id),
+  -- Cohérence des montants: total = subtotal - discount + platform_fee
+  CONSTRAINT amounts_coherence CHECK (
+    total_amount = subtotal - COALESCE(discount_amount, 0) + COALESCE(platform_fee, 0)
+  )
 );
 CREATE INDEX idx_orders_buyer ON public.orders(buyer_id);
 CREATE INDEX idx_orders_seller ON public.orders(seller_id);
@@ -1071,6 +1090,8 @@ CREATE TABLE public.messages (
 );
 CREATE INDEX idx_messages_conversation ON public.messages(conversation_id);
 CREATE INDEX idx_messages_unread ON public.messages(conversation_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX idx_messages_sender_time ON public.messages(sender_id, created_at DESC);
+CREATE INDEX idx_messages_conversation_time ON public.messages(conversation_id, created_at DESC);
 
 -- ============================================================================
 -- 15. NOTIFICATIONS
