@@ -1,6 +1,22 @@
 -- ============================================================================
--- COLLABMARKET V40.2 - PRODUCTION READY MULTI-ROLE SAAS EDITION
+-- COLLABMARKET V40.3 - PRODUCTION READY MULTI-ROLE SAAS EDITION
 -- ============================================================================
+-- [CHANGELOG V40.3]
+-- [FIX] orders: ajout colonnes order_number (auto-généré) et seller_notes
+-- [FIX] influencer_profiles: ajout colonnes manquantes (content_types, platforms,
+--       collaboration_types, audience_size_total, social_platforms, media_kit_url,
+--       price_range_min/max, engagement_rate)
+-- [FIX] v_influencer_public & v_seller_public: correction références colonnes
+-- [SEC] social_links_public_read: restreint aux utilisateurs avec rôle influencer actif
+-- [FEAT] target_roles: conversion de TEXT à TEXT[] pour flexibilité multi-rôle
+--       - Validation dans apply_to_offer() du rôle de l'applicant
+-- [TRIG] trg_influencer_requires_social: exige au moins 1 social_link pour influencer
+-- [TRIG] trg_protect_role_deletion: empêche suppression si services/commandes actifs
+-- [PERF] Index GIN ajoutés:
+--       - freelance_profiles: skills, availability_status
+--       - influencer_profiles: platforms, niche, social_platforms, audience_size
+--       - global_offer_applications: profile_snapshot, services_snapshot
+--
 -- [CHANGELOG V40.2]
 -- [ARCHI] Distinction services influencer/freelance:
 --       - Nouvelle colonne service_role sur services (influencer/freelance)
@@ -204,6 +220,102 @@ CREATE TABLE public.user_roles (
 CREATE INDEX idx_user_roles_user ON public.user_roles(user_id);
 CREATE INDEX idx_user_roles_role ON public.user_roles(role);
 
+-- Trigger: Un influenceur doit avoir au moins 1 réseau social pour être actif
+CREATE OR REPLACE FUNCTION public.check_influencer_social_links()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  -- Vérifie uniquement si on active le rôle influencer
+  IF NEW.role = 'influencer' AND NEW.status = 'active' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.social_links
+      WHERE user_id = NEW.user_id
+    ) THEN
+      RAISE EXCEPTION 'Un influenceur doit avoir au moins un réseau social configuré avant d''activer son rôle'
+        USING ERRCODE = 'check_violation',
+              HINT = 'Ajoutez au moins un réseau social via la table social_links';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_influencer_requires_social
+BEFORE INSERT OR UPDATE ON public.user_roles
+FOR EACH ROW
+WHEN (NEW.role = 'influencer')
+EXECUTE FUNCTION public.check_influencer_social_links();
+
+-- Trigger: Empêcher la suppression d'un rôle avec des services ou commandes actifs
+CREATE OR REPLACE FUNCTION public.protect_role_deletion()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  v_active_services INTEGER;
+  v_active_orders_as_seller INTEGER;
+  v_active_orders_as_buyer INTEGER;
+BEGIN
+  -- Vérifier les services actifs pour ce rôle
+  IF OLD.role IN ('influencer', 'freelance') THEN
+    SELECT COUNT(*) INTO v_active_services
+    FROM public.services
+    WHERE seller_id = OLD.user_id
+      AND service_role = OLD.role
+      AND status IN ('active', 'pending', 'paused');
+
+    IF v_active_services > 0 THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle %: % service(s) actif(s) trouvé(s)', OLD.role, v_active_services
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Archivez ou supprimez d''abord vos services';
+    END IF;
+  END IF;
+
+  -- Vérifier les commandes actives (en tant que vendeur)
+  SELECT COUNT(*) INTO v_active_orders_as_seller
+  FROM public.orders
+  WHERE seller_id = OLD.user_id
+    AND status IN ('pending', 'accepted', 'in_progress', 'delivered', 'revision_requested');
+
+  IF v_active_orders_as_seller > 0 THEN
+    RAISE EXCEPTION 'Impossible de supprimer le rôle %: % commande(s) active(s) en tant que vendeur', OLD.role, v_active_orders_as_seller
+      USING ERRCODE = 'restrict_violation',
+            HINT = 'Terminez d''abord vos commandes en cours';
+  END IF;
+
+  -- Vérifier les commandes actives (en tant qu'acheteur/merchant)
+  IF OLD.role = 'merchant' THEN
+    SELECT COUNT(*) INTO v_active_orders_as_buyer
+    FROM public.orders
+    WHERE buyer_id = OLD.user_id
+      AND status IN ('pending', 'accepted', 'in_progress', 'delivered', 'revision_requested');
+
+    IF v_active_orders_as_buyer > 0 THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle merchant: % commande(s) active(s) en tant qu''acheteur', v_active_orders_as_buyer
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Terminez d''abord vos commandes en cours';
+    END IF;
+  END IF;
+
+  -- Vérifier les conversions non résolues pour agent
+  IF OLD.role = 'agent' THEN
+    IF EXISTS (
+      SELECT 1 FROM public.affiliate_conversions
+      WHERE agent_id = OLD.user_id
+        AND status = 'pending'
+    ) THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle agent: conversions d''affiliation en attente'
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Attendez que les conversions soient résolues';
+    END IF;
+  END IF;
+
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_protect_role_deletion
+BEFORE DELETE ON public.user_roles
+FOR EACH ROW
+EXECUTE FUNCTION public.protect_role_deletion();
+
 -- Préférences dashboard
 CREATE TABLE public.dashboard_preferences (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -229,18 +341,32 @@ CREATE TABLE public.freelance_profiles (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Index pour recherche par compétences
+CREATE INDEX idx_freelance_skills ON public.freelance_profiles USING GIN (skills);
+CREATE INDEX idx_freelance_availability ON public.freelance_profiles(availability_status);
 
 CREATE TABLE public.influencer_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   niche TEXT[] DEFAULT '{}',
+  content_types TEXT[] DEFAULT '{}',           -- Types de contenu: video, photo, story, reel, etc.
+  platforms TEXT[] DEFAULT '{}',               -- Plateformes: instagram, tiktok, youtube, etc.
+  collaboration_types TEXT[] DEFAULT '{}',     -- Types de collab: sponsored, review, unboxing, etc.
   audience_size_total INTEGER DEFAULT 0 CHECK (audience_size_total >= 0),
-  social_platforms JSONB DEFAULT '{}'::jsonb,
+  social_platforms JSONB DEFAULT '{}'::jsonb,  -- Détail par plateforme {instagram: {username, followers}, ...}
   media_kit_url TEXT,
-  min_collaboration_price DECIMAL(10,2) CHECK (min_collaboration_price >= 0),
+  -- Pricing
+  price_range_min DECIMAL(10,2) CHECK (price_range_min >= 0),
+  price_range_max DECIMAL(10,2) CHECK (price_range_max >= price_range_min),
+  min_collaboration_price DECIMAL(10,2) CHECK (min_collaboration_price >= 0),  -- Legacy, utilisé pour compat
   engagement_rate DECIMAL(5,2) CHECK (engagement_rate >= 0 AND engagement_rate <= 100),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Index pour filtrage par plateformes et recherche JSONB
+CREATE INDEX idx_influencer_platforms ON public.influencer_profiles USING GIN (platforms);
+CREATE INDEX idx_influencer_niche ON public.influencer_profiles USING GIN (niche);
+CREATE INDEX idx_influencer_social_platforms ON public.influencer_profiles USING GIN (social_platforms jsonb_path_ops);
+CREATE INDEX idx_influencer_audience_size ON public.influencer_profiles(audience_size_total DESC);
 
 CREATE TABLE public.merchant_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -483,7 +609,11 @@ CREATE TABLE public.global_offers (
   description TEXT NOT NULL,
   budget_min DECIMAL(10,2) CHECK (budget_min >= 0),
   budget_max DECIMAL(10,2) CHECK (budget_max >= budget_min),
-  target_role TEXT CHECK (target_role IN ('influencer', 'freelance', 'both')),
+  target_roles TEXT[] DEFAULT ARRAY['influencer', 'freelance'] CHECK (
+    target_roles IS NOT NULL
+    AND array_length(target_roles, 1) > 0
+    AND target_roles <@ ARRAY['influencer', 'freelance']::TEXT[]
+  ),
   category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL,
   requirements JSONB DEFAULT '[]'::jsonb,
   status TEXT DEFAULT 'open' CHECK (status IN ('draft', 'open', 'in_progress', 'closed', 'archived')),
@@ -521,6 +651,9 @@ CREATE TABLE public.global_offer_applications (
 CREATE INDEX idx_applications_offer ON public.global_offer_applications(offer_id);
 CREATE INDEX idx_applications_applicant ON public.global_offer_applications(applicant_id);
 CREATE INDEX idx_applications_selected ON public.global_offer_applications(offer_id) WHERE is_selected = TRUE;
+-- Index GIN pour recherche dans les snapshots JSONB
+CREATE INDEX idx_applications_profile_snapshot ON public.global_offer_applications USING GIN (profile_snapshot jsonb_path_ops);
+CREATE INDEX idx_applications_services_snapshot ON public.global_offer_applications USING GIN (services_snapshot jsonb_path_ops);
 
 -- Ajouter FK différée sur global_offers.selected_application_id
 ALTER TABLE public.global_offers
@@ -629,30 +762,32 @@ CREATE INDEX idx_conversions_order ON public.affiliate_conversions(order_id);
 
 CREATE TABLE public.orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_number TEXT UNIQUE NOT NULL DEFAULT ('ORD-' || UPPER(encode(gen_random_bytes(6), 'hex'))),
   buyer_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
   seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
   service_id UUID REFERENCES public.services(id) ON DELETE SET NULL,
   global_offer_id UUID REFERENCES public.global_offers(id) ON DELETE SET NULL,
   package_id UUID REFERENCES public.service_packages(id) ON DELETE SET NULL,
   affiliate_link_id UUID REFERENCES public.affiliate_links(id) ON DELETE SET NULL,
-  
+
   order_type TEXT NOT NULL DEFAULT 'standard' CHECK (order_type IN ('standard', 'custom', 'quote_request', 'offer')),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
     'pending', 'payment_authorized', 'accepted', 'in_progress', 'delivered',
     'revision_requested', 'completed', 'disputed', 'cancelled', 'refunded'
   )),
-  
+
   -- Montants
   subtotal DECIMAL(10,2) NOT NULL CHECK (subtotal >= 0),
   discount_amount DECIMAL(10,2) DEFAULT 0 CHECK (discount_amount >= 0),
   platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),
   total_amount DECIMAL(10,2) NOT NULL CHECK (total_amount > 0),
   seller_revenue DECIMAL(10,2) CHECK (seller_revenue >= 0),
-  
+
   -- Requirements & Delivery
   requirements_responses JSONB DEFAULT '[]'::jsonb,
   selected_extras JSONB DEFAULT '[]'::jsonb,
-  brief TEXT,
+  brief TEXT,                    -- Description/brief du client
+  seller_notes TEXT,             -- Notes du vendeur (pour commandes offer/custom)
   delivery_message TEXT,
   delivery_files JSONB DEFAULT '[]'::jsonb,
   revision_count INTEGER DEFAULT 0 CHECK (revision_count >= 0),
@@ -1489,7 +1624,7 @@ $$;
 CREATE OR REPLACE FUNCTION public.create_order_from_application(
   p_application_id UUID,
   p_amount DECIMAL,
-  p_description TEXT DEFAULT NULL,
+  p_brief TEXT DEFAULT NULL,
   p_delivery_days INTEGER DEFAULT 7
 ) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -1531,25 +1666,19 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'INVALID_AMOUNT');
   END IF;
 
-  -- Générer un numéro de commande
-  v_order_number := 'ORD-' || UPPER(encode(gen_random_bytes(6), 'hex'));
-
-  -- Créer la commande
+  -- Créer la commande (order_number auto-généré via DEFAULT)
   INSERT INTO public.orders (
-    order_number,
     buyer_id,
     seller_id,
     global_offer_id,
     order_type,
     status,
-    base_amount,
+    subtotal,
     total_amount,
-    description,
-    seller_notes,
-    expected_delivery_date,
+    brief,
+    delivery_deadline,
     acceptance_deadline
   ) VALUES (
-    v_order_number,
     v_offer.author_id,           -- Le merchant est l'acheteur
     v_application.applicant_id,  -- Le candidat est le vendeur
     v_offer.id,
@@ -1557,11 +1686,10 @@ BEGIN
     'pending',                   -- En attente d'acceptation par le vendeur
     p_amount,
     p_amount,
-    COALESCE(p_description, v_offer.title),
-    NULL,
+    COALESCE(p_brief, v_offer.title || ' - ' || v_offer.description),
     NOW() + (p_delivery_days || ' days')::INTERVAL,
     NOW() + INTERVAL '48 hours'  -- 48h pour accepter
-  ) RETURNING id INTO v_order_id;
+  ) RETURNING id, order_number INTO v_order_id, v_order_number;
 
   -- Marquer l'application comme sélectionnée
   UPDATE public.global_offer_applications SET
@@ -1636,6 +1764,19 @@ BEGIN
     WHERE id = v_user_id AND kyc_status = 'verified' AND stripe_onboarding_completed = TRUE
   ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'KYC_OR_STRIPE_NOT_VERIFIED');
+  END IF;
+
+  -- Vérifier que l'utilisateur a un rôle correspondant aux target_roles de l'offre
+  IF v_offer.target_roles IS NOT NULL AND array_length(v_offer.target_roles, 1) > 0 THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.user_roles ur
+      WHERE ur.user_id = v_user_id
+        AND ur.status = 'active'
+        AND ur.role = ANY(v_offer.target_roles)
+    ) THEN
+      RETURN jsonb_build_object('success', false, 'error', 'ROLE_NOT_MATCHING',
+        'required_roles', v_offer.target_roles);
+    END IF;
   END IF;
 
   -- Créer le snapshot du profil
@@ -2065,11 +2206,12 @@ SELECT
   ip.user_id,
   ip.niche,
   ip.content_types,
-  ip.audience_size,
-  ip.engagement_rate,
   ip.platforms,
-  ip.social_platforms,  -- liens réseaux sociaux publics
   ip.collaboration_types,
+  ip.audience_size_total,
+  ip.engagement_rate,
+  ip.social_platforms,  -- liens réseaux sociaux publics
+  ip.media_kit_url,
   ip.price_range_min,
   ip.price_range_max,
   ip.created_at
@@ -2124,9 +2266,10 @@ SELECT
   fp.availability_status,
   -- Influencer info
   ip.niche,
-  ip.audience_size,
+  ip.audience_size_total,
   ip.engagement_rate,
   ip.platforms as influencer_platforms,
+  ip.content_types,
   -- Roles actifs
   ARRAY(SELECT ur.role FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.status = 'active') as active_roles
 FROM public.profiles p
@@ -2272,7 +2415,19 @@ CREATE POLICY "agent_profiles_owner_read" ON public.agent_profiles FOR SELECT
 CREATE POLICY "agent_profiles_owner_manage" ON public.agent_profiles FOR ALL USING (auth.uid() = user_id);
 
 -- SOCIAL_LINKS
-CREATE POLICY "social_links_public_read" ON public.social_links FOR SELECT USING (true);
+-- Social links publics uniquement pour les influenceurs (les freelances gardent les leurs privés)
+CREATE POLICY "social_links_public_read" ON public.social_links FOR SELECT USING (
+  auth.uid() = user_id  -- Owner peut toujours voir les siens
+  OR public.is_admin()
+  OR public.is_service_role()
+  -- Public seulement si l'utilisateur est influenceur
+  OR EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = social_links.user_id
+      AND ur.role = 'influencer'
+      AND ur.status = 'active'
+  )
+);
 CREATE POLICY "social_links_owner_manage" ON public.social_links FOR ALL USING (auth.uid() = user_id);
 
 -- CREATOR_CODES
