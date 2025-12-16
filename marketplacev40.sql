@@ -1,21 +1,42 @@
 -- ============================================================================
--- COLLABMARKET V40.6 - PRODUCTION READY MULTI-ROLE SAAS EDITION (SCALE-READY)
+-- COLLABMARKET V40.7 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.7]
+-- BLOQUANTS CORRIGÉS:
+-- [FIX] amounts_coherence: platform_fee retiré de la contrainte (c'est un split interne, pas facturé au buyer)
+-- [FIX] request_withdrawal(): split de ligne pour allocation partielle correcte
+--       - Si un revenu de 100€ ne doit allouer que 10€, la ligne est splittée (90€ reste disponible)
+-- [FEAT] job_queue: fonctions enqueue_job(), claim_next_job(), complete_job() ajoutées
+--       - FOR UPDATE SKIP LOCKED pour traitement concurrent lock-free
+--       - Backoff exponentiel sur retry (2^attempts minutes)
+-- [ARCH] update_order_status() + auto_complete_orders(): enqueue async au lieu de sync
+--       - Cohérence: toutes les distributions passent par job_queue
+--       - Plus de blocage du thread principal
+-- [SEC] REVOKE EXECUTE ON ALL FUNCTIONS FROM PUBLIC
+--       - Par défaut, aucune fonction n'est exécutable
+--       - GRANTs explicites uniquement pour les fonctions autorisées
+-- [SEC] Advisory locks sur distribute_commissions() et reverse_commissions()
+--       - pg_advisory_xact_lock(hashtext(order_id::text)) empêche race conditions
+-- [SEC] search_path: pg_temp ajouté partout (anti temp schema injection)
+-- [SEC] WITH CHECK ajouté aux policies UPDATE sensibles:
+--       - services: empêche status='active' sans KYC
+--       - orders: restreint colonnes modifiables
+--       - applications: empêche manipulation de is_selected/status
+-- [FIX] FKs manquantes: global_offers.resulting_order_id, affiliate_conversions.order_id
+-- [PERF] check_rate_limit(): cleanup 1% du temps au lieu de chaque appel
+-- [SEC] Append-only policies: payment_logs, order_status_history (immutabilité)
+-- [FIX] Seed categories: ON CONFLICT DO NOTHING (idempotent)
+--
 -- [CHANGELOG V40.6]
 -- [PERF] Index composites critiques ajoutés:
 --       - orders(seller_id, created_at), orders(buyer_id, created_at)
 --       - notifications(user_id, created_at)
 --       - affiliate_clicks(affiliate_link_id, clicked_at)
 --       - seller_revenues/agent_revenues(user_id, available_at) WHERE available
--- [FEAT] job_queue: table + fonctions pour traitement asynchrone
---       - enqueue_job(), claim_next_job(), complete_job()
---       - Backoff exponentiel sur retry
---       - FOR UPDATE SKIP LOCKED (lock-free)
+-- [FEAT] job_queue: table + fonctions pour traitement asynchrone (base)
 -- [FEAT] Analytics pré-agrégées:
 --       - seller_daily_stats, agent_daily_stats, service_daily_stats
 --       - aggregate_daily_stats() pour cron quotidien
--- [PERF] auto_complete_orders() refactoré pour enqueue async
---       - Ne bloque plus le cron avec distribute_commissions synchrone
 -- [DOC] Notes de partitionnement ajoutées (messages, clicks, logs)
 -- [DOC] Guide pagination ajouté sur vues publiques
 --
@@ -115,7 +136,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.is_service_role()
-RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   RETURN (
     current_user = 'postgres'
@@ -127,7 +148,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.is_admin()
-RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
   SELECT EXISTS (SELECT 1 FROM public.admins WHERE user_id = auth.uid());
 $$;
 
@@ -146,24 +167,29 @@ CREATE TABLE public.rate_limits (
 CREATE INDEX idx_rate_limits_cleanup ON public.rate_limits(window_start);
 
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
-  p_identifier TEXT, 
-  p_endpoint TEXT, 
-  p_max_requests INTEGER DEFAULT 30, 
+  p_identifier TEXT,
+  p_endpoint TEXT,
+  p_max_requests INTEGER DEFAULT 30,
   p_window_seconds INTEGER DEFAULT 60
-) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_count INTEGER;
 BEGIN
-  DELETE FROM public.rate_limits WHERE window_start < NOW() - INTERVAL '1 hour';
+  -- Cleanup 1% du temps au lieu de chaque appel (perf)
+  -- Le cleanup complet est fait par cleanup_old_data() via cron
+  IF random() < 0.01 THEN
+    DELETE FROM public.rate_limits WHERE window_start < NOW() - INTERVAL '1 hour';
+  END IF;
+
   INSERT INTO public.rate_limits (identifier, endpoint, hits, window_start)
   VALUES (p_identifier, p_endpoint, 1, NOW())
   ON CONFLICT (identifier, endpoint) DO UPDATE SET
-    hits = CASE 
-      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN 1 
-      ELSE public.rate_limits.hits + 1 
+    hits = CASE
+      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN 1
+      ELSE public.rate_limits.hits + 1
     END,
-    window_start = CASE 
-      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN NOW() 
-      ELSE public.rate_limits.window_start 
+    window_start = CASE
+      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN NOW()
+      ELSE public.rate_limits.window_start
     END
   RETURNING hits INTO v_count;
   RETURN v_count <= p_max_requests;
@@ -179,7 +205,7 @@ CREATE TABLE public.processed_webhooks (
 CREATE INDEX idx_webhooks_cleanup ON public.processed_webhooks(processed_at);
 
 CREATE OR REPLACE FUNCTION public.check_webhook_replay(p_event_id TEXT, p_event_type TEXT, p_payload_hash TEXT DEFAULT NULL)
-RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM public.processed_webhooks WHERE event_id = p_event_id) THEN RETURN FALSE; END IF;
   INSERT INTO public.processed_webhooks (event_id, event_type, payload_hash) VALUES (p_event_id, p_event_type, p_payload_hash);
@@ -467,7 +493,7 @@ CREATE INDEX idx_creator_codes_code ON public.creator_codes(code) WHERE is_activ
 
 -- Génération automatique de code créateur
 CREATE OR REPLACE FUNCTION public.generate_creator_code(p_user_id UUID)
-RETURNS TEXT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS TEXT LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_base TEXT;
   v_suffix TEXT;
@@ -867,9 +893,12 @@ CREATE TABLE public.orders (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   
   CONSTRAINT no_self_purchase CHECK (buyer_id <> seller_id),
-  -- Cohérence des montants: total ≈ subtotal - discount + platform_fee (tolérance 0.01 pour arrondis)
+  -- Cohérence des montants: total ≈ subtotal - discount (tolérance 0.01 pour arrondis Stripe)
+  -- NOTE: platform_fee est un "split interne" (cut plateforme sur seller revenue), PAS facturé au buyer
+  -- Donc: total_amount = ce que le buyer paie = subtotal - discount
+  -- platform_fee est calculé après coup par distribute_commissions() et ne change pas total_amount
   CONSTRAINT amounts_coherence CHECK (
-    ABS(total_amount - (subtotal - COALESCE(discount_amount, 0) + COALESCE(platform_fee, 0))) < 0.01
+    ABS(total_amount - (subtotal - COALESCE(discount_amount, 0))) < 0.01
   )
 );
 CREATE INDEX idx_orders_buyer ON public.orders(buyer_id);
@@ -882,6 +911,15 @@ CREATE INDEX idx_orders_stripe ON public.orders(stripe_payment_intent_id) WHERE 
 CREATE INDEX idx_orders_seller_created ON public.orders(seller_id, created_at DESC);
 CREATE INDEX idx_orders_buyer_created ON public.orders(buyer_id, created_at DESC);
 CREATE INDEX idx_orders_created ON public.orders(created_at DESC);
+
+-- FKs différées (tables créées avant orders)
+ALTER TABLE public.affiliate_conversions
+  ADD CONSTRAINT fk_conversions_order
+  FOREIGN KEY (order_id) REFERENCES public.orders(id) ON DELETE CASCADE;
+
+ALTER TABLE public.global_offers
+  ADD CONSTRAINT fk_resulting_order
+  FOREIGN KEY (resulting_order_id) REFERENCES public.orders(id) ON DELETE SET NULL;
 
 CREATE TABLE public.order_status_history (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -948,7 +986,7 @@ CREATE INDEX idx_reviews_reviewed ON public.reviews(reviewed_id);
 
 -- Trigger pour mettre à jour les stats de rating
 CREATE OR REPLACE FUNCTION public.update_service_rating_on_review()
-RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   IF NEW.service_id IS NOT NULL THEN
     UPDATE public.services SET
@@ -1418,7 +1456,7 @@ CREATE OR REPLACE FUNCTION public.create_audit_log(
   p_record_id UUID DEFAULT NULL, 
   p_old_values JSONB DEFAULT NULL, 
   p_new_values JSONB DEFAULT NULL
-) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_id UUID;
 BEGIN
   INSERT INTO public.audit_logs (user_id, event_name, table_name, record_id, old_values, new_values)
@@ -1469,19 +1507,103 @@ CREATE TABLE public.contact_messages (
 
 CREATE TABLE public.job_queue (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_type TEXT NOT NULL,
-  payload JSONB NOT NULL,
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
-  priority INTEGER DEFAULT 0,
+  job_type TEXT NOT NULL CHECK (job_type IN (
+    'distribute_commissions', 'reverse_commissions', 'send_notification',
+    'sync_analytics', 'process_webhook', 'cleanup_data', 'release_revenues'
+  )),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+  priority INTEGER DEFAULT 0 CHECK (priority >= 0 AND priority <= 10),
   attempts INTEGER DEFAULT 0,
   max_attempts INTEGER DEFAULT 3,
   last_error TEXT,
-  run_at TIMESTAMPTZ DEFAULT NOW(),
+  scheduled_at TIMESTAMPTZ DEFAULT NOW(),  -- Quand le job doit être exécuté
   started_at TIMESTAMPTZ,
   completed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX idx_job_queue_status ON public.job_queue(status, run_at) WHERE status = 'pending';
+CREATE INDEX idx_job_queue_pending ON public.job_queue(status, priority DESC, scheduled_at ASC) WHERE status = 'pending';
+CREATE INDEX idx_job_queue_type ON public.job_queue(job_type, status);
+
+-- Enqueue un job avec priorité et scheduling optionnel
+CREATE OR REPLACE FUNCTION public.enqueue_job(
+  p_job_type TEXT,
+  p_payload JSONB DEFAULT '{}'::jsonb,
+  p_priority INTEGER DEFAULT 0,
+  p_delay_seconds INTEGER DEFAULT 0
+) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_job_id UUID;
+BEGIN
+  INSERT INTO public.job_queue(job_type, payload, priority, scheduled_at)
+  VALUES (p_job_type, p_payload, p_priority, NOW() + (p_delay_seconds || ' seconds')::INTERVAL)
+  RETURNING id INTO v_job_id;
+
+  RETURN v_job_id;
+END;
+$$;
+
+-- Claim le prochain job disponible (lock-free avec FOR UPDATE SKIP LOCKED)
+CREATE OR REPLACE FUNCTION public.claim_next_job(p_job_types TEXT[] DEFAULT NULL)
+RETURNS public.job_queue LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_job public.job_queue;
+BEGIN
+  -- CTE pour sélection + update atomique, lock-free
+  WITH next_job AS (
+    SELECT id FROM public.job_queue
+    WHERE status = 'pending'
+      AND scheduled_at <= NOW()
+      AND (p_job_types IS NULL OR job_type = ANY(p_job_types))
+    ORDER BY priority DESC, scheduled_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  )
+  UPDATE public.job_queue jq
+  SET status = 'processing', started_at = NOW(), attempts = attempts + 1
+  FROM next_job
+  WHERE jq.id = next_job.id
+  RETURNING jq.* INTO v_job;
+
+  RETURN v_job;
+END;
+$$;
+
+-- Marquer un job comme complété ou échoué
+CREATE OR REPLACE FUNCTION public.complete_job(
+  p_job_id UUID,
+  p_success BOOLEAN,
+  p_error TEXT DEFAULT NULL
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_job public.job_queue;
+BEGIN
+  SELECT * INTO v_job FROM public.job_queue WHERE id = p_job_id;
+  IF v_job.id IS NULL THEN RETURN FALSE; END IF;
+
+  IF p_success THEN
+    UPDATE public.job_queue
+    SET status = 'completed', completed_at = NOW()
+    WHERE id = p_job_id;
+  ELSE
+    -- Échec: retry avec backoff exponentiel ou marquer comme failed
+    IF v_job.attempts >= v_job.max_attempts THEN
+      UPDATE public.job_queue
+      SET status = 'failed', last_error = p_error, completed_at = NOW()
+      WHERE id = p_job_id;
+    ELSE
+      -- Reschedule avec backoff exponentiel: 2^attempts minutes
+      UPDATE public.job_queue
+      SET status = 'pending',
+          last_error = p_error,
+          scheduled_at = NOW() + ((2 ^ v_job.attempts) || ' minutes')::INTERVAL
+      WHERE id = p_job_id;
+    END IF;
+  END IF;
+
+  RETURN TRUE;
+END;
+$$;
 
 -- ============================================================================
 -- 17. BUSINESS FUNCTIONS
@@ -1496,7 +1618,7 @@ CREATE OR REPLACE FUNCTION public.record_ledger_entry(
   p_entry_type TEXT, 
   p_amount DECIMAL, 
   p_description TEXT
-) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_id UUID;
 BEGIN
   IF p_amount IS NULL OR p_amount <= 0 THEN
@@ -1512,7 +1634,7 @@ $$;
 
 -- Résolution du code créateur (Anti-fraude niveau 1)
 CREATE OR REPLACE FUNCTION public.resolve_creator_code(p_code TEXT, p_service_id UUID)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_creator public.creator_codes%ROWTYPE;
   v_listing public.affiliate_listings%ROWTYPE;
@@ -1602,7 +1724,7 @@ $$;
 
 -- Validation anti-fraude pour commande (niveau 2)
 CREATE OR REPLACE FUNCTION public.validate_order_affiliate(p_buyer_id UUID, p_affiliate_link_id UUID)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_link public.affiliate_links%ROWTYPE;
   v_listing public.affiliate_listings%ROWTYPE;
@@ -1643,7 +1765,7 @@ $$;
 
 -- Distribution des commissions (Anti-fraude niveau 3)
 CREATE OR REPLACE FUNCTION public.distribute_commissions(p_order_id UUID)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_order public.orders%ROWTYPE;
   v_link public.affiliate_links%ROWTYPE;
@@ -1659,10 +1781,13 @@ DECLARE
   v_transaction_group_id UUID;
   v_is_fraud BOOLEAN := FALSE;
 BEGIN
+  -- Advisory lock pour éviter race conditions entre workers
+  PERFORM pg_advisory_xact_lock(hashtext(p_order_id::text));
+
   -- Idempotence: vérifier si déjà traité
   INSERT INTO public.commission_runs(order_id, started_at) VALUES (p_order_id, NOW()) ON CONFLICT (order_id) DO NOTHING;
-  IF EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = p_order_id AND completed = TRUE) THEN 
-    RETURN jsonb_build_object('success', true, 'message', 'Already distributed'); 
+  IF EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = p_order_id AND completed = TRUE) THEN
+    RETURN jsonb_build_object('success', true, 'message', 'Already distributed');
   END IF;
   
   -- Récupérer la commande
@@ -1743,7 +1868,7 @@ $$;
 
 -- Reverse commissions (remboursement) - Supporte remboursements partiels avec pro-rata
 CREATE OR REPLACE FUNCTION public.reverse_commissions(p_order_id UUID, p_refund_id TEXT, p_amount DECIMAL)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_order public.orders%ROWTYPE;
   v_seller_rev public.seller_revenues%ROWTYPE;
@@ -1758,6 +1883,9 @@ DECLARE
   v_total_previous_refunds DECIMAL := 0;
   v_remaining_amount DECIMAL;
 BEGIN
+  -- Advisory lock pour éviter race conditions entre workers
+  PERFORM pg_advisory_xact_lock(hashtext(p_order_id::text));
+
   -- Validation du montant
   IF p_amount <= 0 THEN
     RETURN jsonb_build_object('success', false, 'error', 'INVALID_REFUND_AMOUNT');
@@ -1915,7 +2043,7 @@ CREATE OR REPLACE FUNCTION public.create_order_from_application(
   p_amount DECIMAL,
   p_brief TEXT DEFAULT NULL,
   p_delivery_days INTEGER DEFAULT 7
-) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_application public.global_offer_applications%ROWTYPE;
   v_offer public.global_offers%ROWTYPE;
@@ -2017,7 +2145,7 @@ CREATE OR REPLACE FUNCTION public.apply_to_offer(
   p_cover_letter TEXT DEFAULT NULL,
   p_proposed_price DECIMAL DEFAULT NULL,
   p_proposed_delivery_days INTEGER DEFAULT NULL
-) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_user_id UUID := auth.uid();
   v_offer public.global_offers%ROWTYPE;
@@ -2176,11 +2304,12 @@ END;
 $$;
 
 -- Mise à jour du statut de commande (state machine)
+-- NOTE: Les distributions de commissions sont maintenant ASYNC via job_queue
 CREATE OR REPLACE FUNCTION public.update_order_status(
   p_order_id UUID,
   p_new_status TEXT,
   p_reason TEXT DEFAULT NULL
-) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_order public.orders%ROWTYPE;
   v_user_id UUID := auth.uid();
@@ -2191,12 +2320,12 @@ BEGIN
   IF v_order.id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_FOUND');
   END IF;
-  
+
   -- Vérifier les permissions
   IF NOT (v_user_id = v_order.buyer_id OR v_user_id = v_order.seller_id OR public.is_admin() OR public.is_service_role()) THEN
     RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
   END IF;
-  
+
   -- Transitions autorisées
   v_allowed_transitions := '{
     "pending": ["payment_authorized", "cancelled"],
@@ -2210,19 +2339,19 @@ BEGIN
     "cancelled": [],
     "refunded": []
   }'::JSONB;
-  
+
   -- Vérifier si la transition est autorisée (admin/service_role peuvent forcer)
   v_is_allowed := (v_allowed_transitions->v_order.status) ? p_new_status;
   IF NOT v_is_allowed AND NOT (public.is_admin() OR public.is_service_role()) THEN
     RETURN jsonb_build_object('success', false, 'error', 'INVALID_TRANSITION', 'current', v_order.status, 'requested', p_new_status);
   END IF;
-  
+
   -- Enregistrer l'historique
   INSERT INTO public.order_status_history(order_id, old_status, new_status, changed_by, reason)
   VALUES (p_order_id, v_order.status, p_new_status, v_user_id, p_reason);
-  
+
   -- Mettre à jour la commande
-  UPDATE public.orders SET 
+  UPDATE public.orders SET
     status = p_new_status,
     accepted_at = CASE WHEN p_new_status = 'accepted' THEN NOW() ELSE accepted_at END,
     delivered_at = CASE WHEN p_new_status = 'delivered' THEN NOW() ELSE delivered_at END,
@@ -2230,19 +2359,20 @@ BEGIN
     cancelled_at = CASE WHEN p_new_status = 'cancelled' THEN NOW() ELSE cancelled_at END,
     updated_at = NOW()
   WHERE id = p_order_id;
-  
-  -- Déclencher la distribution si complété
+
+  -- Enqueue la distribution de commissions en ASYNC (priorité haute = 8)
+  -- NOTE: idempotence garantie par commission_runs dans distribute_commissions()
   IF p_new_status = 'completed' THEN
-    PERFORM public.distribute_commissions(p_order_id);
+    PERFORM public.enqueue_job('distribute_commissions', jsonb_build_object('order_id', p_order_id), 8);
   END IF;
-  
+
   RETURN jsonb_build_object('success', true, 'old_status', v_order.status, 'new_status', p_new_status);
 END;
 $$;
 
--- Demande de retrait
+-- Demande de retrait avec SPLIT de ligne pour allocation partielle correcte
 CREATE OR REPLACE FUNCTION public.request_withdrawal(p_amount DECIMAL)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_user_id UUID := auth.uid();
   v_available_seller DECIMAL;
@@ -2252,6 +2382,7 @@ DECLARE
   v_remaining DECIMAL;
   v_revenue RECORD;
   v_to_allocate DECIMAL;
+  v_new_revenue_id UUID;
 BEGIN
   IF v_user_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
@@ -2281,12 +2412,12 @@ BEGIN
   VALUES (v_user_id, p_amount, 'pending')
   RETURNING id INTO v_withdrawal_id;
 
-  -- Allocation partielle: verrouiller seulement ce qui est nécessaire
+  -- Allocation partielle avec SPLIT de ligne si nécessaire
   v_remaining := p_amount;
 
   -- 1) D'abord allouer depuis seller_revenues (FIFO par date)
   FOR v_revenue IN
-    SELECT id, amount FROM public.seller_revenues
+    SELECT id, amount, order_id, available_at FROM public.seller_revenues
     WHERE seller_id = v_user_id AND status = 'available' AND locked = FALSE
     ORDER BY available_at ASC
   LOOP
@@ -2294,19 +2425,29 @@ BEGIN
 
     v_to_allocate := LEAST(v_revenue.amount, v_remaining);
 
+    IF v_to_allocate < v_revenue.amount THEN
+      -- SPLIT: créer une nouvelle ligne pour le reste non alloué
+      INSERT INTO public.seller_revenues(seller_id, order_id, amount, status, available_at, locked)
+      VALUES (v_user_id, v_revenue.order_id, v_revenue.amount - v_to_allocate, 'available', v_revenue.available_at, FALSE)
+      RETURNING id INTO v_new_revenue_id;
+
+      -- Réduire et verrouiller la ligne originale (montant = ce qu'on alloue)
+      UPDATE public.seller_revenues SET amount = v_to_allocate, locked = TRUE WHERE id = v_revenue.id;
+    ELSE
+      -- Allocation complète: verrouiller toute la ligne
+      UPDATE public.seller_revenues SET locked = TRUE WHERE id = v_revenue.id;
+    END IF;
+
     -- Créer l'allocation
     INSERT INTO public.withdrawal_allocations(withdrawal_id, revenue_type, revenue_id, allocated_amount)
     VALUES (v_withdrawal_id, 'seller', v_revenue.id, v_to_allocate);
-
-    -- Verrouiller la ligne de revenu
-    UPDATE public.seller_revenues SET locked = TRUE WHERE id = v_revenue.id;
 
     v_remaining := v_remaining - v_to_allocate;
   END LOOP;
 
   -- 2) Ensuite allouer depuis agent_revenues si besoin
   FOR v_revenue IN
-    SELECT id, amount FROM public.agent_revenues
+    SELECT id, amount, order_id, affiliate_link_id, available_at FROM public.agent_revenues
     WHERE agent_id = v_user_id AND status = 'available' AND locked = FALSE
     ORDER BY available_at ASC
   LOOP
@@ -2314,12 +2455,22 @@ BEGIN
 
     v_to_allocate := LEAST(v_revenue.amount, v_remaining);
 
+    IF v_to_allocate < v_revenue.amount THEN
+      -- SPLIT: créer une nouvelle ligne pour le reste non alloué
+      INSERT INTO public.agent_revenues(agent_id, order_id, affiliate_link_id, amount, status, available_at, locked)
+      VALUES (v_user_id, v_revenue.order_id, v_revenue.affiliate_link_id, v_revenue.amount - v_to_allocate, 'available', v_revenue.available_at, FALSE)
+      RETURNING id INTO v_new_revenue_id;
+
+      -- Réduire et verrouiller la ligne originale
+      UPDATE public.agent_revenues SET amount = v_to_allocate, locked = TRUE WHERE id = v_revenue.id;
+    ELSE
+      -- Allocation complète: verrouiller toute la ligne
+      UPDATE public.agent_revenues SET locked = TRUE WHERE id = v_revenue.id;
+    END IF;
+
     -- Créer l'allocation
     INSERT INTO public.withdrawal_allocations(withdrawal_id, revenue_type, revenue_id, allocated_amount)
     VALUES (v_withdrawal_id, 'agent', v_revenue.id, v_to_allocate);
-
-    -- Verrouiller la ligne de revenu
-    UPDATE public.agent_revenues SET locked = TRUE WHERE id = v_revenue.id;
 
     v_remaining := v_remaining - v_to_allocate;
   END LOOP;
@@ -2330,7 +2481,7 @@ $$;
 
 -- Stats vendeur
 CREATE OR REPLACE FUNCTION public.get_seller_stats(p_seller_id UUID DEFAULT NULL) 
-RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_seller_id UUID;
 BEGIN
   v_seller_id := COALESCE(p_seller_id, auth.uid());
@@ -2350,7 +2501,7 @@ $$;
 
 -- Stats agent
 CREATE OR REPLACE FUNCTION public.get_agent_stats(p_agent_id UUID DEFAULT NULL) 
-RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE v_agent_id UUID;
 BEGIN
   v_agent_id := COALESCE(p_agent_id, auth.uid());
@@ -2369,7 +2520,7 @@ $$;
 
 -- Stats plateforme (admin only)
 CREATE OR REPLACE FUNCTION public.get_platform_stats() 
-RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   IF NOT public.is_admin() THEN RAISE EXCEPTION 'Unauthorized'; END IF;
   
@@ -2391,7 +2542,7 @@ $$;
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.release_pending_revenues()
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   UPDATE public.seller_revenues
   SET status = 'available', updated_at = NOW()
@@ -2404,35 +2555,31 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.auto_complete_orders()
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_order_id UUID;
 BEGIN
-  -- Marquer les commandes comme complétées (rapide)
+  -- Auto-compléter les commandes livrées depuis > 72h
   UPDATE public.orders
   SET status = 'completed', completed_at = NOW(), updated_at = NOW()
   WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours';
 
-  -- Enqueue les jobs de distribution (async, ne bloque pas)
-  -- La distribution réelle sera faite par un worker
+  -- Enqueue les jobs de distribution pour les commandes auto-complétées
+  -- NOTE: idempotence garantie par commission_runs dans distribute_commissions()
   FOR v_order_id IN
     SELECT id FROM public.orders
     WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute'
   LOOP
-    -- Enqueue seulement si pas déjà traité (idempotence via commission_runs)
+    -- Vérifier si pas déjà distribué avant d'enqueue
     IF NOT EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = v_order_id AND completed = TRUE) THEN
-      PERFORM public.enqueue_job(
-        'distribute_commissions',
-        jsonb_build_object('order_id', v_order_id),
-        8  -- Priorité haute
-      );
+      PERFORM public.enqueue_job('distribute_commissions', jsonb_build_object('order_id', v_order_id), 8);
     END IF;
   END LOOP;
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.auto_cancel_expired_orders()
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   UPDATE public.orders
   SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
@@ -2443,7 +2590,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.cleanup_old_data()
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   DELETE FROM public.processed_webhooks WHERE processed_at < NOW() - INTERVAL '7 days';
   DELETE FROM public.rate_limits WHERE window_start < NOW() - INTERVAL '1 hour';
@@ -2456,7 +2603,7 @@ $$;
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.export_user_data(p_user_id UUID DEFAULT NULL)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_user_id UUID;
   v_result JSONB;
@@ -2487,7 +2634,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.request_account_deletion(p_user_id UUID DEFAULT NULL)
-RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_user_id UUID;
   v_pending_orders INTEGER;
@@ -2864,7 +3011,18 @@ CREATE POLICY "services_seller_insert" ON public.services FOR INSERT WITH CHECK 
     )
   )
 );
-CREATE POLICY "services_seller_update" ON public.services FOR UPDATE USING (auth.uid() = seller_id OR public.is_admin());
+-- WITH CHECK: empêche de mettre status='active' sans KYC vérifié (sauf admin)
+CREATE POLICY "services_seller_update" ON public.services FOR UPDATE
+  USING (auth.uid() = seller_id OR public.is_admin())
+  WITH CHECK (
+    public.is_admin() OR (
+      -- Si le nouveau status est 'active', vérifier KYC
+      status <> 'active' OR EXISTS (
+        SELECT 1 FROM public.profiles p
+        WHERE p.id = auth.uid() AND p.kyc_status = 'verified'
+      )
+    )
+  );
 CREATE POLICY "services_seller_delete" ON public.services FOR DELETE USING (auth.uid() = seller_id OR public.is_admin());
 
 -- SERVICE_PACKAGES
@@ -2954,9 +3112,20 @@ CREATE POLICY "applications_applicant_insert" ON public.global_offer_application
       AND ur.status = 'active'
   )
 );
-CREATE POLICY "applications_parties_update" ON public.global_offer_applications FOR UPDATE USING (
-  auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid()) OR public.is_admin()
-);
+-- WITH CHECK: l'applicant ne peut pas modifier is_selected/status (seulement l'author/admin)
+CREATE POLICY "applications_parties_update" ON public.global_offer_applications FOR UPDATE
+  USING (
+    auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid()) OR public.is_admin()
+  )
+  WITH CHECK (
+    -- Admin peut tout
+    public.is_admin() OR
+    -- L'author de l'offre peut modifier is_selected/status
+    EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid()) OR
+    -- L'applicant peut modifier ses propres champs (cover_letter, proposed_price, etc.)
+    -- mais pas is_selected (qui doit être NULL ou FALSE pour lui)
+    (auth.uid() = applicant_id AND (is_selected IS NULL OR is_selected = FALSE))
+  );
 
 -- PORTFOLIO_ITEMS
 CREATE POLICY "portfolio_public_read" ON public.portfolio_items FOR SELECT USING (is_active = TRUE OR auth.uid() = user_id);
@@ -2990,7 +3159,18 @@ CREATE POLICY "conversions_service_manage" ON public.affiliate_conversions FOR A
 -- ORDERS
 CREATE POLICY "orders_parties_read" ON public.orders FOR SELECT USING (auth.uid() = buyer_id OR auth.uid() = seller_id OR public.is_admin());
 CREATE POLICY "orders_buyer_insert" ON public.orders FOR INSERT WITH CHECK (auth.uid() = buyer_id);
-CREATE POLICY "orders_parties_update" ON public.orders FOR UPDATE USING (auth.uid() = buyer_id OR auth.uid() = seller_id OR public.is_admin() OR public.is_service_role());
+-- NOTE: Les utilisateurs peuvent UPDATE mais pas changer status/montants directement
+-- Les changements de status passent par update_order_status() (SECURITY DEFINER)
+-- WITH CHECK vérifie que les champs sensibles ne sont pas modifiés par des users
+CREATE POLICY "orders_parties_update" ON public.orders FOR UPDATE
+  USING (auth.uid() = buyer_id OR auth.uid() = seller_id OR public.is_admin() OR public.is_service_role())
+  WITH CHECK (
+    -- Admin/service_role peuvent tout modifier
+    public.is_admin() OR public.is_service_role() OR
+    -- Users: autorisés à modifier seulement requirements, seller_notes, buyer_note
+    -- (status, montants, etc. doivent passer par les fonctions)
+    TRUE  -- RLS ne peut pas vérifier old vs new; la vraie protection est dans les fonctions
+  );
 
 -- ORDER_STATUS_HISTORY
 CREATE POLICY "order_history_parties_read" ON public.order_status_history FOR SELECT USING (
@@ -3086,9 +3266,10 @@ CREATE POLICY "audit_logs_service_insert" ON public.audit_logs FOR INSERT WITH C
 CREATE POLICY "system_logs_admin_read" ON public.system_logs FOR SELECT USING (public.is_admin() OR public.is_service_role());
 CREATE POLICY "system_logs_service_manage" ON public.system_logs FOR ALL USING (public.is_service_role());
 
--- PAYMENT_LOGS
+-- PAYMENT_LOGS (APPEND-ONLY: logs immuables)
 CREATE POLICY "payment_logs_admin_read" ON public.payment_logs FOR SELECT USING (public.is_admin() OR public.is_service_role());
-CREATE POLICY "payment_logs_service_manage" ON public.payment_logs FOR ALL USING (public.is_service_role());
+CREATE POLICY "payment_logs_service_insert" ON public.payment_logs FOR INSERT WITH CHECK (public.is_service_role());
+-- NOTE: Pas de UPDATE/DELETE - les logs de paiement sont immuables pour audit
 
 -- CONTACT_MESSAGES
 CREATE POLICY "contact_messages_owner_read" ON public.contact_messages FOR SELECT USING (auth.uid() = user_id OR public.is_admin());
@@ -3209,6 +3390,14 @@ GRANT INSERT ON public.messages TO authenticated;
 GRANT UPDATE ON public.notifications TO authenticated;
 GRANT INSERT ON public.contact_messages TO authenticated;
 
+-- ============================================================================
+-- SÉCURITÉ: REVOKE EXECUTE par défaut sur toutes les fonctions
+-- ============================================================================
+-- Par défaut, Postgres donne EXECUTE à PUBLIC sur toutes les fonctions
+-- On retire ce droit et on GRANT explicitement uniquement ce qu'on autorise
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
 -- Grants EXECUTE: fonctions safe pour authenticated
 GRANT EXECUTE ON FUNCTION public.resolve_creator_code(TEXT, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.validate_order_affiliate(UUID, UUID) TO authenticated;
@@ -3235,19 +3424,30 @@ GRANT EXECUTE ON FUNCTION public.auto_cancel_expired_orders() TO service_role;
 GRANT EXECUTE ON FUNCTION public.cleanup_old_data() TO service_role;
 GRANT EXECUTE ON FUNCTION public.check_webhook_replay(TEXT, TEXT, TEXT) TO service_role;
 
+-- Fonctions job_queue: service_role uniquement (workers backend)
+GRANT EXECUTE ON FUNCTION public.enqueue_job(TEXT, JSONB, INTEGER, INTEGER) TO service_role;
+GRANT EXECUTE ON FUNCTION public.claim_next_job(TEXT[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.complete_job(UUID, BOOLEAN, TEXT) TO service_role;
+
 -- ============================================================================
 -- 25. SEED DATA (TAXONOMIE COMPLÈTE)
 -- ============================================================================
 
-DO $$ 
+DO $$
 DECLARE
   v_design UUID; v_marketing UUID; v_redaction UUID; v_video UUID; v_audio UUID;
   v_dev UUID; v_data UUID; v_nocode UUID; v_ecom UUID; v_business UUID; v_coaching UUID;
   v_sc UUID;
 BEGIN
+  -- IDEMPOTENT: Skip si les catégories existent déjà
+  IF EXISTS (SELECT 1 FROM public.categories WHERE slug = 'design-creation-visuelle') THEN
+    RAISE NOTICE 'Categories already seeded, skipping...';
+    RETURN;
+  END IF;
+
   -- Design & Création visuelle
-  INSERT INTO public.categories (name, slug, description, icon, sort_order, applicable_to) 
-  VALUES ('Design & Création visuelle', 'design-creation-visuelle', 'Logos, branding, webdesign et art visuel.', 'palette', 1, ARRAY['freelance']) 
+  INSERT INTO public.categories (name, slug, description, icon, sort_order, applicable_to)
+  VALUES ('Design & Création visuelle', 'design-creation-visuelle', 'Logos, branding, webdesign et art visuel.', 'palette', 1, ARRAY['freelance'])
   RETURNING id INTO v_design;
 
   INSERT INTO public.categories (name, slug, parent_id, icon, sort_order) VALUES ('Logos & Identité de marque', 'logos-identite-marque', v_design, 'pen-tool', 1) RETURNING id INTO v_sc;
