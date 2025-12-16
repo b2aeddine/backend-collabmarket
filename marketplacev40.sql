@@ -1,6 +1,24 @@
 -- ============================================================================
--- COLLABMARKET V40.5 - PRODUCTION READY MULTI-ROLE SAAS EDITION
+-- COLLABMARKET V40.6 - PRODUCTION READY MULTI-ROLE SAAS EDITION (SCALE-READY)
 -- ============================================================================
+-- [CHANGELOG V40.6]
+-- [PERF] Index composites critiques ajoutés:
+--       - orders(seller_id, created_at), orders(buyer_id, created_at)
+--       - notifications(user_id, created_at)
+--       - affiliate_clicks(affiliate_link_id, clicked_at)
+--       - seller_revenues/agent_revenues(user_id, available_at) WHERE available
+-- [FEAT] job_queue: table + fonctions pour traitement asynchrone
+--       - enqueue_job(), claim_next_job(), complete_job()
+--       - Backoff exponentiel sur retry
+--       - FOR UPDATE SKIP LOCKED (lock-free)
+-- [FEAT] Analytics pré-agrégées:
+--       - seller_daily_stats, agent_daily_stats, service_daily_stats
+--       - aggregate_daily_stats() pour cron quotidien
+-- [PERF] auto_complete_orders() refactoré pour enqueue async
+--       - Ne bloque plus le cron avec distribute_commissions synchrone
+-- [DOC] Notes de partitionnement ajoutées (messages, clicks, logs)
+-- [DOC] Guide pagination ajouté sur vues publiques
+--
 -- [CHANGELOG V40.5]
 -- [SEC] GRANT SELECT ON ALL TABLES remplacé par GRANTs ciblés (réduction surface d'attaque)
 -- [SEC] creator_codes_public_read supprimé (anti-scraping, résolution via fonction SECURITY DEFINER)
@@ -13,7 +31,6 @@
 -- [FEAT] request_withdrawal(): allocation FIFO des revenus (ne verrouille plus tout le solde)
 -- [FIX] apply_to_offer(): snapshot social_links utilisait sl.profile_url au lieu de sl.url
 -- [DOC] platform_fee: commentaires clarifiants (MONTANT, pas taux)
--- [DOC] auto_complete_orders(): note sur protection idempotence via commission_runs
 --
 -- [CHANGELOG V40.4]
 -- [FIX] merchant_profiles: ajout colonne description (manquante pour v_merchant_public)
@@ -752,6 +769,8 @@ CREATE INDEX idx_affiliate_links_agent ON public.affiliate_links(agent_id);
 CREATE INDEX idx_affiliate_links_listing ON public.affiliate_links(listing_id);
 CREATE INDEX idx_affiliate_links_code ON public.affiliate_links(code) WHERE is_active = TRUE;
 
+-- NOTE SCALE: Table à fort volume - partitionner par mois si >500k rows/mois
+-- Ou archiver les clicks >30 jours vers table cold storage
 CREATE TABLE public.affiliate_clicks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   affiliate_link_id UUID NOT NULL REFERENCES public.affiliate_links(id) ON DELETE CASCADE,
@@ -763,6 +782,7 @@ CREATE TABLE public.affiliate_clicks (
 );
 CREATE INDEX idx_affiliate_clicks_link ON public.affiliate_clicks(affiliate_link_id);
 CREATE INDEX idx_affiliate_clicks_date ON public.affiliate_clicks(clicked_at);
+CREATE INDEX idx_affiliate_clicks_link_date ON public.affiliate_clicks(affiliate_link_id, clicked_at DESC);
 
 CREATE TABLE public.affiliate_conversions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -858,6 +878,10 @@ CREATE INDEX idx_orders_status ON public.orders(status);
 CREATE INDEX idx_orders_service ON public.orders(service_id);
 CREATE INDEX idx_orders_affiliate ON public.orders(affiliate_link_id) WHERE affiliate_link_id IS NOT NULL;
 CREATE INDEX idx_orders_stripe ON public.orders(stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL;
+-- Index composites pour listings paginés (CRITIQUE pour perf)
+CREATE INDEX idx_orders_seller_created ON public.orders(seller_id, created_at DESC);
+CREATE INDEX idx_orders_buyer_created ON public.orders(buyer_id, created_at DESC);
+CREATE INDEX idx_orders_created ON public.orders(created_at DESC);
 
 CREATE TABLE public.order_status_history (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -993,6 +1017,7 @@ CREATE TABLE public.seller_revenues (
 );
 CREATE INDEX idx_seller_revenues_seller ON public.seller_revenues(seller_id);
 CREATE INDEX idx_seller_revenues_status ON public.seller_revenues(status);
+CREATE INDEX idx_seller_revenues_seller_available ON public.seller_revenues(seller_id, available_at ASC) WHERE status = 'available';
 
 CREATE TABLE public.agent_revenues (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1009,6 +1034,7 @@ CREATE TABLE public.agent_revenues (
 );
 CREATE INDEX idx_agent_revenues_agent ON public.agent_revenues(agent_id);
 CREATE INDEX idx_agent_revenues_status ON public.agent_revenues(status);
+CREATE INDEX idx_agent_revenues_agent_available ON public.agent_revenues(agent_id, available_at ASC) WHERE status = 'available';
 
 CREATE TABLE public.platform_revenues (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1048,6 +1074,99 @@ CREATE TABLE public.withdrawal_allocations (
 CREATE INDEX idx_withdrawal_allocations_withdrawal ON public.withdrawal_allocations(withdrawal_id);
 CREATE INDEX idx_withdrawal_allocations_revenue ON public.withdrawal_allocations(revenue_type, revenue_id);
 
+-- ============================================================================
+-- JOB QUEUE (traitement asynchrone pour performance)
+-- ============================================================================
+-- Pattern: enqueue rapide, traitement par worker (Edge Function cron ou externe)
+CREATE TABLE public.job_queue (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  job_type TEXT NOT NULL CHECK (job_type IN (
+    'distribute_commissions',
+    'reverse_commissions',
+    'send_notification',
+    'sync_analytics',
+    'process_webhook',
+    'cleanup_data'
+  )),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  priority INTEGER DEFAULT 0 CHECK (priority >= 0 AND priority <= 10),  -- 0=low, 10=urgent
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+  attempts INTEGER DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts INTEGER DEFAULT 3 CHECK (max_attempts >= 1),
+  last_error TEXT,
+  scheduled_at TIMESTAMPTZ DEFAULT NOW(),  -- Pour jobs différés
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_job_queue_pending ON public.job_queue(status, priority DESC, scheduled_at ASC) WHERE status = 'pending';
+CREATE INDEX idx_job_queue_type ON public.job_queue(job_type, status);
+CREATE INDEX idx_job_queue_scheduled ON public.job_queue(scheduled_at) WHERE status = 'pending';
+
+-- Fonction pour enqueue un job (utilisée par les autres fonctions)
+CREATE OR REPLACE FUNCTION public.enqueue_job(
+  p_job_type TEXT,
+  p_payload JSONB DEFAULT '{}'::jsonb,
+  p_priority INTEGER DEFAULT 5,
+  p_scheduled_at TIMESTAMPTZ DEFAULT NOW()
+) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_job_id UUID;
+BEGIN
+  INSERT INTO public.job_queue (job_type, payload, priority, scheduled_at)
+  VALUES (p_job_type, p_payload, p_priority, p_scheduled_at)
+  RETURNING id INTO v_job_id;
+
+  RETURN v_job_id;
+END;
+$$;
+
+-- Fonction pour récupérer le prochain job (appelée par worker)
+CREATE OR REPLACE FUNCTION public.claim_next_job(p_job_types TEXT[] DEFAULT NULL)
+RETURNS public.job_queue LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_job public.job_queue;
+BEGIN
+  -- Sélectionner et verrouiller le prochain job
+  UPDATE public.job_queue
+  SET status = 'processing', started_at = NOW(), attempts = attempts + 1
+  WHERE id = (
+    SELECT id FROM public.job_queue
+    WHERE status = 'pending'
+      AND scheduled_at <= NOW()
+      AND (p_job_types IS NULL OR job_type = ANY(p_job_types))
+    ORDER BY priority DESC, scheduled_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING * INTO v_job;
+
+  RETURN v_job;
+END;
+$$;
+
+-- Fonction pour marquer un job comme terminé
+CREATE OR REPLACE FUNCTION public.complete_job(p_job_id UUID, p_success BOOLEAN, p_error TEXT DEFAULT NULL)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  UPDATE public.job_queue
+  SET
+    status = CASE
+      WHEN p_success THEN 'completed'
+      WHEN attempts >= max_attempts THEN 'failed'
+      ELSE 'pending'  -- Retry
+    END,
+    completed_at = CASE WHEN p_success OR attempts >= max_attempts THEN NOW() ELSE NULL END,
+    last_error = p_error,
+    scheduled_at = CASE
+      WHEN NOT p_success AND attempts < max_attempts
+      THEN NOW() + (POWER(2, attempts) || ' minutes')::INTERVAL  -- Backoff exponentiel
+      ELSE scheduled_at
+    END
+  WHERE id = p_job_id;
+END;
+$$;
+
 CREATE TABLE public.commission_runs (
   order_id UUID PRIMARY KEY REFERENCES public.orders(id) ON DELETE CASCADE,
   started_at TIMESTAMPTZ DEFAULT NOW(),
@@ -1065,6 +1184,120 @@ CREATE TABLE public.reverse_runs (
   amount DECIMAL(10,2),
   PRIMARY KEY (order_id, refund_id)
 );
+
+-- ============================================================================
+-- ANALYTICS PRÉ-AGRÉGÉES (performance dashboards)
+-- ============================================================================
+-- Pattern: agrégation par cron, lecture instantanée
+
+-- Stats journalières vendeur (services + commandes)
+CREATE TABLE public.seller_daily_stats (
+  seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  stat_date DATE NOT NULL,
+  -- Commandes
+  orders_count INTEGER DEFAULT 0,
+  orders_completed INTEGER DEFAULT 0,
+  orders_cancelled INTEGER DEFAULT 0,
+  orders_revenue DECIMAL(12,2) DEFAULT 0,
+  -- Services
+  services_views INTEGER DEFAULT 0,
+  services_impressions INTEGER DEFAULT 0,
+  -- Conversations
+  messages_sent INTEGER DEFAULT 0,
+  messages_received INTEGER DEFAULT 0,
+  response_time_avg_minutes INTEGER,
+  -- Timestamp
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (seller_id, stat_date)
+);
+CREATE INDEX idx_seller_daily_stats_date ON public.seller_daily_stats(stat_date DESC);
+
+-- Stats journalières agent (affiliation)
+CREATE TABLE public.agent_daily_stats (
+  agent_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  stat_date DATE NOT NULL,
+  -- Clicks & conversions
+  clicks_count INTEGER DEFAULT 0,
+  unique_visitors INTEGER DEFAULT 0,
+  conversions_count INTEGER DEFAULT 0,
+  conversion_rate DECIMAL(5,2) DEFAULT 0,
+  -- Revenus
+  commission_gross DECIMAL(12,2) DEFAULT 0,
+  commission_net DECIMAL(12,2) DEFAULT 0,
+  -- Par plateforme (JSONB pour flexibilité)
+  clicks_by_source JSONB DEFAULT '{}'::jsonb,
+  -- Timestamp
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (agent_id, stat_date)
+);
+CREATE INDEX idx_agent_daily_stats_date ON public.agent_daily_stats(stat_date DESC);
+
+-- Stats journalières service (pour trending, analytics vendeur)
+CREATE TABLE public.service_daily_stats (
+  service_id UUID NOT NULL REFERENCES public.services(id) ON DELETE CASCADE,
+  stat_date DATE NOT NULL,
+  -- Vues & engagement
+  views INTEGER DEFAULT 0,
+  unique_views INTEGER DEFAULT 0,
+  favorites_added INTEGER DEFAULT 0,
+  favorites_removed INTEGER DEFAULT 0,
+  -- Conversions
+  orders_count INTEGER DEFAULT 0,
+  orders_revenue DECIMAL(12,2) DEFAULT 0,
+  -- Timestamp
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (service_id, stat_date)
+);
+CREATE INDEX idx_service_daily_stats_date ON public.service_daily_stats(stat_date DESC);
+CREATE INDEX idx_service_daily_stats_service ON public.service_daily_stats(service_id, stat_date DESC);
+
+-- Fonction pour agréger les stats (appelée par cron quotidien)
+CREATE OR REPLACE FUNCTION public.aggregate_daily_stats(p_date DATE DEFAULT CURRENT_DATE - 1)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  -- Agrégation vendeurs
+  INSERT INTO public.seller_daily_stats (seller_id, stat_date, orders_count, orders_completed, orders_revenue)
+  SELECT
+    seller_id,
+    p_date,
+    COUNT(*),
+    COUNT(*) FILTER (WHERE status = 'completed'),
+    COALESCE(SUM(total_amount) FILTER (WHERE status = 'completed'), 0)
+  FROM public.orders
+  WHERE DATE(created_at) = p_date
+  GROUP BY seller_id
+  ON CONFLICT (seller_id, stat_date)
+  DO UPDATE SET
+    orders_count = EXCLUDED.orders_count,
+    orders_completed = EXCLUDED.orders_completed,
+    orders_revenue = EXCLUDED.orders_revenue,
+    updated_at = NOW();
+
+  -- Agrégation agents
+  INSERT INTO public.agent_daily_stats (agent_id, stat_date, clicks_count, conversions_count, commission_net)
+  SELECT
+    al.agent_id,
+    p_date,
+    COALESCE(SUM(ac.click_count), 0),
+    COUNT(DISTINCT conv.id),
+    COALESCE(SUM(conv.agent_commission_net), 0)
+  FROM public.affiliate_links al
+  LEFT JOIN (
+    SELECT affiliate_link_id, COUNT(*) as click_count
+    FROM public.affiliate_clicks
+    WHERE DATE(clicked_at) = p_date
+    GROUP BY affiliate_link_id
+  ) ac ON ac.affiliate_link_id = al.id
+  LEFT JOIN public.affiliate_conversions conv ON conv.affiliate_link_id = al.id AND DATE(conv.confirmed_at) = p_date
+  GROUP BY al.agent_id
+  ON CONFLICT (agent_id, stat_date)
+  DO UPDATE SET
+    clicks_count = EXCLUDED.clicks_count,
+    conversions_count = EXCLUDED.conversions_count,
+    commission_net = EXCLUDED.commission_net,
+    updated_at = NOW();
+END;
+$$;
 
 -- ============================================================================
 -- 13. BANK ACCOUNTS
@@ -1107,6 +1340,9 @@ CREATE INDEX idx_conversations_p1 ON public.conversations(participant_1_id);
 CREATE INDEX idx_conversations_p2 ON public.conversations(participant_2_id);
 CREATE INDEX idx_conversations_canonical ON public.conversations(canonical_p1, canonical_p2);
 
+-- NOTE SCALE: À partitionner par mois si >1M rows
+-- ALTER TABLE messages PARTITION BY RANGE (created_at);
+-- CREATE TABLE messages_2024_01 PARTITION OF messages FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
 CREATE TABLE public.messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id UUID NOT NULL REFERENCES public.conversations(id) ON DELETE CASCADE,
@@ -1140,10 +1376,13 @@ CREATE TABLE public.notifications (
 );
 CREATE INDEX idx_notifications_user ON public.notifications(user_id);
 CREATE INDEX idx_notifications_unread ON public.notifications(user_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX idx_notifications_user_created ON public.notifications(user_id, created_at DESC);
 
 -- ============================================================================
 -- 16. AUDIT & LOGS
 -- ============================================================================
+-- NOTE SCALE: Tables à fort volume - partitionner par mois si >1M rows
+-- Stratégie recommandée: garder 90 jours online, archiver vers S3/cold storage
 
 CREATE TABLE public.audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2166,16 +2405,29 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.auto_complete_orders()
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_order_id UUID;
 BEGIN
+  -- Marquer les commandes comme complétées (rapide)
   UPDATE public.orders
   SET status = 'completed', completed_at = NOW(), updated_at = NOW()
   WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours';
 
-  -- Distribuer les commissions pour les commandes auto-complétées
-  -- NOTE: Double distribution impossible grâce à commission_runs (idempotence)
-  PERFORM public.distribute_commissions(id)
-  FROM public.orders
-  WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute';
+  -- Enqueue les jobs de distribution (async, ne bloque pas)
+  -- La distribution réelle sera faite par un worker
+  FOR v_order_id IN
+    SELECT id FROM public.orders
+    WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute'
+  LOOP
+    -- Enqueue seulement si pas déjà traité (idempotence via commission_runs)
+    IF NOT EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = v_order_id AND completed = TRUE) THEN
+      PERFORM public.enqueue_job(
+        'distribute_commissions',
+        jsonb_build_object('order_id', v_order_id),
+        8  -- Priorité haute
+      );
+    END IF;
+  END LOOP;
 END;
 $$;
 
@@ -2282,6 +2534,16 @@ $$;
 -- ============================================================================
 -- 20. VIEWS (IA/RAG Safe)
 -- ============================================================================
+-- IMPORTANT PAGINATION: Toujours utiliser LIMIT/OFFSET ou curseur côté client
+-- Exemple Supabase JS:
+--   supabase.from('v_services_public')
+--     .select('*')
+--     .order('created_at', { ascending: false })
+--     .range(0, 19)  // 20 premiers résultats
+--
+-- Pour les listings volumineux, préférer keyset pagination:
+--   .lt('created_at', lastSeenTimestamp)
+--   .limit(20)
 
 CREATE OR REPLACE VIEW public.v_services_public AS
 SELECT 
