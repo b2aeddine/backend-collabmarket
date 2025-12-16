@@ -1,17 +1,81 @@
 -- ============================================================================
--- COLLABMARKET V40.0 - PRODUCTION READY MULTI-ROLE SAAS EDITION
+-- COLLABMARKET V40.5 - PRODUCTION READY MULTI-ROLE SAAS EDITION
 -- ============================================================================
+-- [CHANGELOG V40.5]
+-- [SEC] GRANT SELECT ON ALL TABLES remplacé par GRANTs ciblés (réduction surface d'attaque)
+-- [SEC] creator_codes_public_read supprimé (anti-scraping, résolution via fonction SECURITY DEFINER)
+-- [SEC] services_public_read: ajout is_service_role() pour accès backend complet
+-- [SEC] Snapshots apply_to_offer(): whitelist colonnes au lieu de row_to_json(*) (anti-fuite)
+-- [SEC] Harmonisation SET search_path=public sur toutes les fonctions SECURITY DEFINER
+-- [FIX] amounts_coherence: tolérance 0.01 pour arrondis Stripe (évite rejets légitimes)
+-- [FIX] services.slug: UNIQUE(seller_id, slug) au lieu de global (permet même slug cross-sellers)
+-- [FEAT] withdrawal_allocations: table pour verrouillage partiel des revenus
+-- [FEAT] request_withdrawal(): allocation FIFO des revenus (ne verrouille plus tout le solde)
+-- [FIX] apply_to_offer(): snapshot social_links utilisait sl.profile_url au lieu de sl.url
+-- [DOC] platform_fee: commentaires clarifiants (MONTANT, pas taux)
+-- [DOC] auto_complete_orders(): note sur protection idempotence via commission_runs
+--
+-- [CHANGELOG V40.4]
+-- [FIX] merchant_profiles: ajout colonne description (manquante pour v_merchant_public)
+-- [FIX] agent_profiles: ajout colonnes marketing_channels, audience_description,
+--       experience_level (manquantes pour v_agent_public)
+-- [CONSTRAINT] orders.amounts_coherence: vérifie total ≈ subtotal - discount + platform_fee
+-- [PERF] Index supplémentaires messages:
+--       - idx_messages_sender_time (sender_id, created_at DESC)
+--       - idx_messages_conversation_time (conversation_id, created_at DESC)
+--
+-- [CHANGELOG V40.3]
+-- [FIX] orders: ajout colonnes order_number (auto-généré) et seller_notes
+-- [FIX] influencer_profiles: ajout colonnes manquantes (content_types, platforms,
+--       collaboration_types, audience_size_total, social_platforms, media_kit_url,
+--       price_range_min/max, engagement_rate)
+-- [FIX] v_influencer_public & v_seller_public: correction références colonnes
+-- [SEC] social_links_public_read: restreint aux utilisateurs avec rôle influencer actif
+-- [FEAT] target_roles: conversion de TEXT à TEXT[] pour flexibilité multi-rôle
+--       - Validation dans apply_to_offer() du rôle de l'applicant
+-- [TRIG] trg_influencer_requires_social: exige au moins 1 social_link pour influencer
+-- [TRIG] trg_protect_role_deletion: empêche suppression si services/commandes actifs
+-- [PERF] Index GIN ajoutés:
+--       - freelance_profiles: skills, availability_status
+--       - influencer_profiles: platforms, niche, social_platforms, audience_size
+--       - global_offer_applications: profile_snapshot, services_snapshot
+--
+-- [CHANGELOG V40.2]
+-- [ARCHI] Distinction services influencer/freelance:
+--       - Nouvelle colonne service_role sur services (influencer/freelance)
+--       - Vérification que le seller a le rôle correspondant via RLS
+-- [SEC] Privacy profiles totalement refactorisée (CRITIQUE):
+--       - profiles_authenticated_read supprimée (exposait toutes les colonnes)
+--       - Seul le owner peut lire son propre profil complet
+--       - Admins/service_role ont accès total
+--       - user_roles et role-profiles restreints au owner/admin
+-- [SEC] KYC/Stripe enforcement:
+--       - services INSERT: vérifie rôle actif + KYC pour publier (sauf draft)
+--       - global_offer_applications INSERT: KYC + Stripe requis pour postuler
+--       - global_offers INSERT: restreint aux merchants
+-- [FIX] Conversations unique bidirectionnelle:
+--       - Colonnes canonical_p1/canonical_p2 avec LEAST/GREATEST
+--       - Empêche les doublons (A,B) et (B,A)
+-- [FEAT] Workflow complet appels d'offres:
+--       - global_offers: selected_application_id, resulting_order_id
+--       - global_offer_applications: snapshots profil/portfolio/services
+--       - order_type 'offer' ajouté
+--       - Fonctions create_order_from_application() et apply_to_offer()
+-- [FIX] resolve_creator_code: vérifie que l'agent a le rôle 'agent' actif
+-- [FIX] reverse_commissions: correction erreurs d'arrondis
+--       - Ratio calculé sur montant RESTANT (pas total original)
+--       - Évite les erreurs cumulées lors de remboursements multiples
+-- [VIEWS] Nouvelles vues publiques sécurisées:
+--       - v_freelance_public, v_influencer_public, v_merchant_public, v_agent_public
+--       - v_seller_public (vue unifiée des vendeurs)
+--
+-- [CHANGELOG V40.1]
+-- [FIX] reverse_commissions: support remboursements partiels avec pro-rata
+-- [SEC] Vie privée profiles renforcée (GRANT SELECT profiles retiré pour anon)
+--
 -- [CHANGELOG V40.0]
--- [FIX] Colonne client_discount_rate ajoutée à affiliate_listings
--- [FIX] Colonne acceptance_deadline ajoutée à orders
--- [FIX] reverse_commissions corrigée (gestion NULL, agent, platform)
--- [FIX] Triggers update_updated_at_column attachés
--- [FIX] creator_codes trigger empêche DELETE
--- [SEC] RLS complète sur TOUTES les tables sensibles
--- [SEC] Policies manquantes ajoutées (services, global_offers, etc.)
--- [SEC] GRANT EXECUTE restreint pour fonctions financières
--- [SEC] bank_accounts, revenues, withdrawals protégés
--- [PERF] Index optimisés sur colonnes fréquemment filtrées
+-- [FIX] Colonnes client_discount_rate, acceptance_deadline ajoutées
+-- [SEC] RLS complète, GRANT EXECUTE restreint
 -- [ARCHI] Multi-rôles complet (Influencer, Merchant, Freelance, Agent)
 -- ============================================================================
 
@@ -34,10 +98,10 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.is_service_role()
-RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER AS $$
+RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
 BEGIN
   RETURN (
-    current_user = 'postgres' 
+    current_user = 'postgres'
     OR COALESCE(current_setting('request.jwt.claims', true)::json->>'role', '') = 'service_role'
   );
 EXCEPTION WHEN OTHERS THEN
@@ -179,6 +243,102 @@ CREATE TABLE public.user_roles (
 CREATE INDEX idx_user_roles_user ON public.user_roles(user_id);
 CREATE INDEX idx_user_roles_role ON public.user_roles(role);
 
+-- Trigger: Un influenceur doit avoir au moins 1 réseau social pour être actif
+CREATE OR REPLACE FUNCTION public.check_influencer_social_links()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  -- Vérifie uniquement si on active le rôle influencer
+  IF NEW.role = 'influencer' AND NEW.status = 'active' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.social_links
+      WHERE user_id = NEW.user_id
+    ) THEN
+      RAISE EXCEPTION 'Un influenceur doit avoir au moins un réseau social configuré avant d''activer son rôle'
+        USING ERRCODE = 'check_violation',
+              HINT = 'Ajoutez au moins un réseau social via la table social_links';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_influencer_requires_social
+BEFORE INSERT OR UPDATE ON public.user_roles
+FOR EACH ROW
+WHEN (NEW.role = 'influencer')
+EXECUTE FUNCTION public.check_influencer_social_links();
+
+-- Trigger: Empêcher la suppression d'un rôle avec des services ou commandes actifs
+CREATE OR REPLACE FUNCTION public.protect_role_deletion()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  v_active_services INTEGER;
+  v_active_orders_as_seller INTEGER;
+  v_active_orders_as_buyer INTEGER;
+BEGIN
+  -- Vérifier les services actifs pour ce rôle
+  IF OLD.role IN ('influencer', 'freelance') THEN
+    SELECT COUNT(*) INTO v_active_services
+    FROM public.services
+    WHERE seller_id = OLD.user_id
+      AND service_role = OLD.role
+      AND status IN ('active', 'pending', 'paused');
+
+    IF v_active_services > 0 THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle %: % service(s) actif(s) trouvé(s)', OLD.role, v_active_services
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Archivez ou supprimez d''abord vos services';
+    END IF;
+  END IF;
+
+  -- Vérifier les commandes actives (en tant que vendeur)
+  SELECT COUNT(*) INTO v_active_orders_as_seller
+  FROM public.orders
+  WHERE seller_id = OLD.user_id
+    AND status IN ('pending', 'accepted', 'in_progress', 'delivered', 'revision_requested');
+
+  IF v_active_orders_as_seller > 0 THEN
+    RAISE EXCEPTION 'Impossible de supprimer le rôle %: % commande(s) active(s) en tant que vendeur', OLD.role, v_active_orders_as_seller
+      USING ERRCODE = 'restrict_violation',
+            HINT = 'Terminez d''abord vos commandes en cours';
+  END IF;
+
+  -- Vérifier les commandes actives (en tant qu'acheteur/merchant)
+  IF OLD.role = 'merchant' THEN
+    SELECT COUNT(*) INTO v_active_orders_as_buyer
+    FROM public.orders
+    WHERE buyer_id = OLD.user_id
+      AND status IN ('pending', 'accepted', 'in_progress', 'delivered', 'revision_requested');
+
+    IF v_active_orders_as_buyer > 0 THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle merchant: % commande(s) active(s) en tant qu''acheteur', v_active_orders_as_buyer
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Terminez d''abord vos commandes en cours';
+    END IF;
+  END IF;
+
+  -- Vérifier les conversions non résolues pour agent
+  IF OLD.role = 'agent' THEN
+    IF EXISTS (
+      SELECT 1 FROM public.affiliate_conversions
+      WHERE agent_id = OLD.user_id
+        AND status = 'pending'
+    ) THEN
+      RAISE EXCEPTION 'Impossible de supprimer le rôle agent: conversions d''affiliation en attente'
+        USING ERRCODE = 'restrict_violation',
+              HINT = 'Attendez que les conversions soient résolues';
+    END IF;
+  END IF;
+
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_protect_role_deletion
+BEFORE DELETE ON public.user_roles
+FOR EACH ROW
+EXECUTE FUNCTION public.protect_role_deletion();
+
 -- Préférences dashboard
 CREATE TABLE public.dashboard_preferences (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -204,22 +364,37 @@ CREATE TABLE public.freelance_profiles (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Index pour recherche par compétences
+CREATE INDEX idx_freelance_skills ON public.freelance_profiles USING GIN (skills);
+CREATE INDEX idx_freelance_availability ON public.freelance_profiles(availability_status);
 
 CREATE TABLE public.influencer_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   niche TEXT[] DEFAULT '{}',
+  content_types TEXT[] DEFAULT '{}',           -- Types de contenu: video, photo, story, reel, etc.
+  platforms TEXT[] DEFAULT '{}',               -- Plateformes: instagram, tiktok, youtube, etc.
+  collaboration_types TEXT[] DEFAULT '{}',     -- Types de collab: sponsored, review, unboxing, etc.
   audience_size_total INTEGER DEFAULT 0 CHECK (audience_size_total >= 0),
-  social_platforms JSONB DEFAULT '{}'::jsonb,
+  social_platforms JSONB DEFAULT '{}'::jsonb,  -- Détail par plateforme {instagram: {username, followers}, ...}
   media_kit_url TEXT,
-  min_collaboration_price DECIMAL(10,2) CHECK (min_collaboration_price >= 0),
+  -- Pricing
+  price_range_min DECIMAL(10,2) CHECK (price_range_min >= 0),
+  price_range_max DECIMAL(10,2) CHECK (price_range_max >= price_range_min),
+  min_collaboration_price DECIMAL(10,2) CHECK (min_collaboration_price >= 0),  -- Legacy, utilisé pour compat
   engagement_rate DECIMAL(5,2) CHECK (engagement_rate >= 0 AND engagement_rate <= 100),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- Index pour filtrage par plateformes et recherche JSONB
+CREATE INDEX idx_influencer_platforms ON public.influencer_profiles USING GIN (platforms);
+CREATE INDEX idx_influencer_niche ON public.influencer_profiles USING GIN (niche);
+CREATE INDEX idx_influencer_social_platforms ON public.influencer_profiles USING GIN (social_platforms jsonb_path_ops);
+CREATE INDEX idx_influencer_audience_size ON public.influencer_profiles(audience_size_total DESC);
 
 CREATE TABLE public.merchant_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   company_name TEXT CHECK (LENGTH(company_name) <= 200),
+  description TEXT CHECK (LENGTH(description) <= 2000),  -- Description publique de l'entreprise
   vat_number TEXT CHECK (LENGTH(vat_number) <= 50),
   industry TEXT CHECK (LENGTH(industry) <= 100),
   company_size TEXT CHECK (company_size IN ('solo', 'small', 'medium', 'large', 'enterprise')),
@@ -232,6 +407,11 @@ CREATE TABLE public.merchant_profiles (
 CREATE TABLE public.agent_profiles (
   user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
   agency_name TEXT CHECK (LENGTH(agency_name) <= 200),
+  -- Infos publiques pour les agents affiliés
+  marketing_channels TEXT[] DEFAULT '{}',  -- Canaux de marketing: blog, youtube, social, email, etc.
+  audience_description TEXT CHECK (LENGTH(audience_description) <= 1000),  -- Description de l'audience cible
+  experience_level TEXT CHECK (experience_level IN ('beginner', 'intermediate', 'advanced', 'expert')),
+  -- Commission et stats
   commission_rate_default DECIMAL(5,2) DEFAULT 10.0 CHECK (commission_rate_default >= 0 AND commission_rate_default <= 50),
   total_generated_revenue DECIMAL(12,2) DEFAULT 0 CHECK (total_generated_revenue >= 0),
   total_conversions INTEGER DEFAULT 0 CHECK (total_conversions >= 0),
@@ -356,8 +536,10 @@ CREATE TABLE public.services (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL,
+  -- Distinction influencer/freelance service
+  service_role TEXT NOT NULL DEFAULT 'freelance' CHECK (service_role IN ('influencer', 'freelance')),
   title TEXT NOT NULL CHECK (LENGTH(title) >= 10 AND LENGTH(title) <= 200),
-  slug TEXT NOT NULL UNIQUE,
+  slug TEXT NOT NULL,  -- Unique par seller (voir contrainte ci-dessous)
   description TEXT NOT NULL CHECK (LENGTH(description) >= 50),
   search_tags TEXT[] DEFAULT '{}',
   base_price DECIMAL(10,2) NOT NULL CHECK (base_price >= 5),
@@ -376,8 +558,11 @@ CREATE TABLE public.services (
 CREATE INDEX idx_services_seller ON public.services(seller_id);
 CREATE INDEX idx_services_category ON public.services(category_id);
 CREATE INDEX idx_services_status ON public.services(status);
+CREATE INDEX idx_services_role ON public.services(service_role);
 CREATE INDEX idx_services_active ON public.services(status, is_affiliable) WHERE status = 'active';
 CREATE INDEX idx_services_search ON public.services USING GIN (to_tsvector('french', title || ' ' || description));
+-- Slug unique par vendeur (permet à différents vendeurs d'avoir le même slug)
+CREATE UNIQUE INDEX idx_services_seller_slug ON public.services(seller_id, slug);
 
 CREATE TABLE public.service_packages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -455,11 +640,18 @@ CREATE TABLE public.global_offers (
   description TEXT NOT NULL,
   budget_min DECIMAL(10,2) CHECK (budget_min >= 0),
   budget_max DECIMAL(10,2) CHECK (budget_max >= budget_min),
-  target_role TEXT CHECK (target_role IN ('influencer', 'freelance', 'both')),
+  target_roles TEXT[] DEFAULT ARRAY['influencer', 'freelance'] CHECK (
+    target_roles IS NOT NULL
+    AND array_length(target_roles, 1) > 0
+    AND target_roles <@ ARRAY['influencer', 'freelance']::TEXT[]
+  ),
   category_id UUID REFERENCES public.categories(id) ON DELETE SET NULL,
   requirements JSONB DEFAULT '[]'::jsonb,
-  status TEXT DEFAULT 'open' CHECK (status IN ('draft', 'open', 'closed', 'archived')),
+  status TEXT DEFAULT 'open' CHECK (status IN ('draft', 'open', 'in_progress', 'closed', 'archived')),
   applicants_count INTEGER DEFAULT 0 CHECK (applicants_count >= 0),
+  -- Workflow: application sélectionnée et commande liée
+  selected_application_id UUID,  -- FK ajoutée après création de global_offer_applications
+  resulting_order_id UUID,       -- FK ajoutée après création de orders
   deadline TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -474,13 +666,30 @@ CREATE TABLE public.global_offer_applications (
   applicant_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   cover_letter TEXT,
   proposed_price DECIMAL(10,2),
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected', 'withdrawn')),
+  proposed_delivery_days INTEGER CHECK (proposed_delivery_days >= 1),
+  -- Snapshots au moment de la candidature (RGPD: état au moment de l'apply)
+  profile_snapshot JSONB,      -- username, display_name, bio, avatar, skills, etc.
+  portfolio_snapshot JSONB,    -- items portfolio au moment de l'apply
+  services_snapshot JSONB,     -- services actifs au moment de l'apply
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'shortlisted', 'accepted', 'rejected', 'withdrawn')),
+  -- Flag si sélectionné pour créer la commande
+  is_selected BOOLEAN DEFAULT FALSE,
+  selected_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (offer_id, applicant_id)
 );
 CREATE INDEX idx_applications_offer ON public.global_offer_applications(offer_id);
 CREATE INDEX idx_applications_applicant ON public.global_offer_applications(applicant_id);
+CREATE INDEX idx_applications_selected ON public.global_offer_applications(offer_id) WHERE is_selected = TRUE;
+-- Index GIN pour recherche dans les snapshots JSONB
+CREATE INDEX idx_applications_profile_snapshot ON public.global_offer_applications USING GIN (profile_snapshot jsonb_path_ops);
+CREATE INDEX idx_applications_services_snapshot ON public.global_offer_applications USING GIN (services_snapshot jsonb_path_ops);
+
+-- Ajouter FK différée sur global_offers.selected_application_id
+ALTER TABLE public.global_offers
+  ADD CONSTRAINT fk_selected_application
+  FOREIGN KEY (selected_application_id) REFERENCES public.global_offer_applications(id) ON DELETE SET NULL;
 
 -- ============================================================================
 -- 8. PORTFOLIO
@@ -567,11 +776,11 @@ CREATE TABLE public.affiliate_conversions (
   agent_commission_gross DECIMAL(10,2) DEFAULT 0 CHECK (agent_commission_gross >= 0),
   platform_cut_on_agent DECIMAL(10,2) DEFAULT 0 CHECK (platform_cut_on_agent >= 0),
   agent_commission_net DECIMAL(10,2) DEFAULT 0 CHECK (agent_commission_net >= 0),
-  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),
+  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),  -- MONTANT total plateforme (pas un taux)
   seller_revenue DECIMAL(10,2) DEFAULT 0 CHECK (seller_revenue >= 0),
   agent_commission_rate DECIMAL(5,2),
   platform_cut_rate DECIMAL(5,2),
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'reversed')),
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'reversed', 'partial_refund')),
   confirmed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -584,30 +793,32 @@ CREATE INDEX idx_conversions_order ON public.affiliate_conversions(order_id);
 
 CREATE TABLE public.orders (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_number TEXT UNIQUE NOT NULL DEFAULT ('ORD-' || UPPER(encode(gen_random_bytes(6), 'hex'))),
   buyer_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
   seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
   service_id UUID REFERENCES public.services(id) ON DELETE SET NULL,
   global_offer_id UUID REFERENCES public.global_offers(id) ON DELETE SET NULL,
   package_id UUID REFERENCES public.service_packages(id) ON DELETE SET NULL,
   affiliate_link_id UUID REFERENCES public.affiliate_links(id) ON DELETE SET NULL,
-  
-  order_type TEXT NOT NULL DEFAULT 'standard' CHECK (order_type IN ('standard', 'custom', 'quote_request')),
+
+  order_type TEXT NOT NULL DEFAULT 'standard' CHECK (order_type IN ('standard', 'custom', 'quote_request', 'offer')),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
     'pending', 'payment_authorized', 'accepted', 'in_progress', 'delivered',
     'revision_requested', 'completed', 'disputed', 'cancelled', 'refunded'
   )),
-  
+
   -- Montants
   subtotal DECIMAL(10,2) NOT NULL CHECK (subtotal >= 0),
   discount_amount DECIMAL(10,2) DEFAULT 0 CHECK (discount_amount >= 0),
-  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),
+  platform_fee DECIMAL(10,2) DEFAULT 0 CHECK (platform_fee >= 0),  -- MONTANT (pas un taux), calculé par distribute_commissions()
   total_amount DECIMAL(10,2) NOT NULL CHECK (total_amount > 0),
   seller_revenue DECIMAL(10,2) CHECK (seller_revenue >= 0),
-  
+
   -- Requirements & Delivery
   requirements_responses JSONB DEFAULT '[]'::jsonb,
   selected_extras JSONB DEFAULT '[]'::jsonb,
-  brief TEXT,
+  brief TEXT,                    -- Description/brief du client
+  seller_notes TEXT,             -- Notes du vendeur (pour commandes offer/custom)
   delivery_message TEXT,
   delivery_files JSONB DEFAULT '[]'::jsonb,
   revision_count INTEGER DEFAULT 0 CHECK (revision_count >= 0),
@@ -635,7 +846,11 @@ CREATE TABLE public.orders (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   
-  CONSTRAINT no_self_purchase CHECK (buyer_id <> seller_id)
+  CONSTRAINT no_self_purchase CHECK (buyer_id <> seller_id),
+  -- Cohérence des montants: total ≈ subtotal - discount + platform_fee (tolérance 0.01 pour arrondis)
+  CONSTRAINT amounts_coherence CHECK (
+    ABS(total_amount - (subtotal - COALESCE(discount_amount, 0) + COALESCE(platform_fee, 0))) < 0.01
+  )
 );
 CREATE INDEX idx_orders_buyer ON public.orders(buyer_id);
 CREATE INDEX idx_orders_seller ON public.orders(seller_id);
@@ -820,6 +1035,19 @@ CREATE TABLE public.withdrawals (
 CREATE INDEX idx_withdrawals_user ON public.withdrawals(user_id);
 CREATE INDEX idx_withdrawals_status ON public.withdrawals(status);
 
+-- Table pour allocation partielle des retraits (évite de verrouiller tout le solde)
+CREATE TABLE public.withdrawal_allocations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  withdrawal_id UUID NOT NULL REFERENCES public.withdrawals(id) ON DELETE CASCADE,
+  revenue_type TEXT NOT NULL CHECK (revenue_type IN ('seller', 'agent')),
+  revenue_id UUID NOT NULL,  -- ID de seller_revenues ou agent_revenues
+  allocated_amount DECIMAL(10,2) NOT NULL CHECK (allocated_amount > 0),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (withdrawal_id, revenue_type, revenue_id)
+);
+CREATE INDEX idx_withdrawal_allocations_withdrawal ON public.withdrawal_allocations(withdrawal_id);
+CREATE INDEX idx_withdrawal_allocations_revenue ON public.withdrawal_allocations(revenue_type, revenue_id);
+
 CREATE TABLE public.commission_runs (
   order_id UUID PRIMARY KEY REFERENCES public.orders(id) ON DELETE CASCADE,
   started_at TIMESTAMPTZ DEFAULT NOW(),
@@ -862,17 +1090,22 @@ CREATE INDEX idx_bank_accounts_user ON public.bank_accounts(user_id);
 
 CREATE TABLE public.conversations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Colonnes générées pour ordre canonique (évite doublons A,B et B,A)
   participant_1_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   participant_2_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  -- Colonnes canoniques pour unicité (participant_1 < participant_2)
+  canonical_p1 UUID GENERATED ALWAYS AS (LEAST(participant_1_id, participant_2_id)) STORED,
+  canonical_p2 UUID GENERATED ALWAYS AS (GREATEST(participant_1_id, participant_2_id)) STORED,
   last_message_at TIMESTAMPTZ DEFAULT NOW(),
   participant_1_archived BOOLEAN DEFAULT FALSE,
   participant_2_archived BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   CONSTRAINT conversation_different CHECK (participant_1_id <> participant_2_id),
-  UNIQUE (participant_1_id, participant_2_id)
+  UNIQUE (canonical_p1, canonical_p2)  -- Unicité sur colonnes canoniques
 );
 CREATE INDEX idx_conversations_p1 ON public.conversations(participant_1_id);
 CREATE INDEX idx_conversations_p2 ON public.conversations(participant_2_id);
+CREATE INDEX idx_conversations_canonical ON public.conversations(canonical_p1, canonical_p2);
 
 CREATE TABLE public.messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -886,6 +1119,8 @@ CREATE TABLE public.messages (
 );
 CREATE INDEX idx_messages_conversation ON public.messages(conversation_id);
 CREATE INDEX idx_messages_unread ON public.messages(conversation_id, is_read) WHERE is_read = FALSE;
+CREATE INDEX idx_messages_sender_time ON public.messages(sender_id, created_at DESC);
+CREATE INDEX idx_messages_conversation_time ON public.messages(conversation_id, created_at DESC);
 
 -- ============================================================================
 -- 15. NOTIFICATIONS
@@ -1047,68 +1282,79 @@ DECLARE
   v_seller_id UUID;
   v_user_id UUID := auth.uid();
   v_rate_ok BOOLEAN;
+  v_has_agent_role BOOLEAN;
 BEGIN
   -- Validation des paramètres
-  IF p_code IS NULL OR p_service_id IS NULL THEN 
-    RETURN jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS'); 
+  IF p_code IS NULL OR p_service_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_PARAMETERS');
   END IF;
-  
+
   -- Rate limiting
   IF v_user_id IS NOT NULL THEN
     SELECT public.check_rate_limit(v_user_id::TEXT, 'resolve_creator_code', 30, 60) INTO v_rate_ok;
-    IF NOT v_rate_ok THEN 
-      RETURN jsonb_build_object('success', false, 'error', 'RATE_LIMIT_EXCEEDED'); 
+    IF NOT v_rate_ok THEN
+      RETURN jsonb_build_object('success', false, 'error', 'RATE_LIMIT_EXCEEDED');
     END IF;
   END IF;
-  
+
   -- Trouver le créateur
   SELECT * INTO v_creator FROM public.creator_codes WHERE code = UPPER(TRIM(p_code)) AND is_active = TRUE;
-  IF v_creator.user_id IS NULL THEN 
-    RETURN jsonb_build_object('success', false, 'error', 'UNKNOWN_CREATOR_CODE'); 
+  IF v_creator.user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNKNOWN_CREATOR_CODE');
   END IF;
   v_agent_id := v_creator.user_id;
-  
-  -- Anti-fraude: Auto-référencement interdit
-  IF v_user_id IS NOT NULL AND v_agent_id = v_user_id THEN 
-    RETURN jsonb_build_object('success', false, 'error', 'SELF_REFERRAL_FORBIDDEN'); 
+
+  -- Vérifier que l'agent a le rôle "agent" actif
+  SELECT EXISTS (
+    SELECT 1 FROM public.user_roles
+    WHERE user_id = v_agent_id AND role = 'agent' AND status = 'active'
+  ) INTO v_has_agent_role;
+
+  IF NOT v_has_agent_role THEN
+    RETURN jsonb_build_object('success', false, 'error', 'AGENT_ROLE_NOT_ACTIVE');
   END IF;
-  
+
+  -- Anti-fraude: Auto-référencement interdit
+  IF v_user_id IS NOT NULL AND v_agent_id = v_user_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'SELF_REFERRAL_FORBIDDEN');
+  END IF;
+
   -- Trouver le listing affilié
-  SELECT l.* INTO v_listing 
+  SELECT l.* INTO v_listing
   FROM public.affiliate_listings l
   JOIN public.services s ON s.id = l.service_id
-  WHERE l.service_id = p_service_id 
-    AND l.is_active = TRUE 
-    AND s.is_affiliable = TRUE 
+  WHERE l.service_id = p_service_id
+    AND l.is_active = TRUE
+    AND s.is_affiliable = TRUE
     AND s.status = 'active'
   LIMIT 1;
-  
-  IF v_listing.id IS NULL THEN 
-    RETURN jsonb_build_object('success', false, 'error', 'TARGET_NOT_AFFILIABLE'); 
+
+  IF v_listing.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'TARGET_NOT_AFFILIABLE');
   END IF;
-  
+
   -- Anti-fraude: Agent = Seller interdit
   SELECT seller_id INTO v_seller_id FROM public.services WHERE id = p_service_id;
-  IF v_agent_id = v_seller_id THEN 
-    RETURN jsonb_build_object('success', false, 'error', 'AGENT_IS_SELLER'); 
+  IF v_agent_id = v_seller_id THEN
+    RETURN jsonb_build_object('success', false, 'error', 'AGENT_IS_SELLER');
   END IF;
-  
+
   -- Obtenir ou créer le lien affilié
   SELECT * INTO v_affiliate_link FROM public.affiliate_links WHERE listing_id = v_listing.id AND agent_id = v_agent_id LIMIT 1;
-  
+
   IF v_affiliate_link.id IS NULL THEN
     INSERT INTO public.affiliate_links(code, url_slug, listing_id, agent_id)
     VALUES (encode(gen_random_bytes(6), 'hex'), encode(gen_random_bytes(6), 'hex'), v_listing.id, v_agent_id)
     RETURNING * INTO v_affiliate_link;
   END IF;
-  
+
   -- Incrémenter le compteur d'utilisation
   UPDATE public.creator_codes SET total_uses = total_uses + 1, updated_at = NOW() WHERE user_id = v_agent_id;
-  
+
   RETURN jsonb_build_object(
-    'success', true, 
-    'affiliate_link_id', v_affiliate_link.id, 
-    'agent_id', v_agent_id, 
+    'success', true,
+    'affiliate_link_id', v_affiliate_link.id,
+    'agent_id', v_agent_id,
     'discount_rate', v_listing.client_discount_rate,
     'code', v_affiliate_link.code
   );
@@ -1256,7 +1502,7 @@ BEGIN
 END;
 $$;
 
--- Reverse commissions (remboursement)
+-- Reverse commissions (remboursement) - Supporte remboursements partiels avec pro-rata
 CREATE OR REPLACE FUNCTION public.reverse_commissions(p_order_id UUID, p_refund_id TEXT, p_amount DECIMAL)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 DECLARE
@@ -1266,7 +1512,18 @@ DECLARE
   v_platform_rev public.platform_revenues%ROWTYPE;
   v_group UUID;
   v_refund_status TEXT := 'full';
+  v_refund_ratio DECIMAL;
+  v_seller_refund DECIMAL := 0;
+  v_agent_refund DECIMAL := 0;
+  v_platform_refund DECIMAL := 0;
+  v_total_previous_refunds DECIMAL := 0;
+  v_remaining_amount DECIMAL;
 BEGIN
+  -- Validation du montant
+  IF p_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_REFUND_AMOUNT');
+  END IF;
+
   -- Idempotence
   IF EXISTS(SELECT 1 FROM public.reverse_runs WHERE order_id = p_order_id AND refund_id = p_refund_id) THEN
     RETURN jsonb_build_object('success', true, 'message', 'Already reversed');
@@ -1276,51 +1533,406 @@ BEGIN
   IF v_order.id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_FOUND');
   END IF;
-  
+
+  -- Calculer les remboursements précédents pour cette commande
+  SELECT COALESCE(SUM(amount), 0) INTO v_total_previous_refunds
+  FROM public.reverse_runs
+  WHERE order_id = p_order_id AND completed = TRUE;
+
+  -- Vérifier qu'on ne rembourse pas plus que le montant restant
+  v_remaining_amount := v_order.total_amount - v_total_previous_refunds;
+  IF p_amount > v_remaining_amount THEN
+    RETURN jsonb_build_object('success', false, 'error', 'REFUND_EXCEEDS_REMAINING',
+      'remaining', v_remaining_amount, 'requested', p_amount);
+  END IF;
+
   -- Déterminer si remboursement partiel ou total
-  IF p_amount < v_order.total_amount THEN 
-    v_refund_status := 'partial'; 
+  IF (v_total_previous_refunds + p_amount) < v_order.total_amount THEN
+    v_refund_status := 'partial';
+  END IF;
+
+  -- Calculer le ratio de remboursement
+  -- IMPORTANT: basé sur le montant RESTANT, pas le total original
+  -- Cela évite les erreurs d'arrondis cumulés lors de remboursements multiples
+  IF v_remaining_amount > 0 THEN
+    v_refund_ratio := p_amount / v_remaining_amount;
+  ELSE
+    v_refund_ratio := 0;
   END IF;
 
   INSERT INTO public.reverse_runs(order_id, refund_id, amount) VALUES (p_order_id, p_refund_id, p_amount);
   v_group := gen_random_uuid();
 
-  -- Reverser le revenu vendeur
+  -- Reverser le revenu vendeur (pro-rata basé sur le remaining)
   SELECT * INTO v_seller_rev FROM public.seller_revenues WHERE order_id = p_order_id;
   IF v_seller_rev.id IS NOT NULL AND v_seller_rev.amount > 0 THEN
-    UPDATE public.seller_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_seller_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_rev.seller_id, 'debit', v_seller_rev.amount, 'Refund reversal');
+    -- Si remboursement complet ou le ratio est 1 (tout le restant), prendre tout le montant restant
+    IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
+      v_seller_refund := v_seller_rev.amount;
+    ELSE
+      v_seller_refund := ROUND(v_seller_rev.amount * v_refund_ratio, 2);
+    END IF;
+
+    IF v_refund_status = 'full' THEN
+      -- Remboursement complet: marquer comme reversed
+      UPDATE public.seller_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_seller_rev.id;
+    ELSE
+      -- Remboursement partiel: réduire le montant disponible
+      UPDATE public.seller_revenues SET
+        amount = amount - v_seller_refund,
+        updated_at = NOW()
+      WHERE id = v_seller_rev.id;
+    END IF;
+
+    IF v_seller_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_rev.seller_id, 'debit', v_seller_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
-  -- Reverser le revenu agent
+  -- Reverser le revenu agent (pro-rata basé sur le remaining)
   SELECT * INTO v_agent_rev FROM public.agent_revenues WHERE order_id = p_order_id;
   IF v_agent_rev.id IS NOT NULL AND v_agent_rev.amount > 0 THEN
-    UPDATE public.agent_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_agent_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_rev.agent_id, 'debit', v_agent_rev.amount, 'Refund reversal');
-    
-    -- Mettre à jour affiliate_conversions
-    UPDATE public.affiliate_conversions SET status = 'reversed' WHERE order_id = p_order_id;
+    -- Même logique: si complet ou ratio >= 1, prendre tout
+    IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
+      v_agent_refund := v_agent_rev.amount;
+    ELSE
+      v_agent_refund := ROUND(v_agent_rev.amount * v_refund_ratio, 2);
+    END IF;
+
+    IF v_refund_status = 'full' THEN
+      UPDATE public.agent_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_agent_rev.id;
+      -- Marquer la conversion comme reversed
+      UPDATE public.affiliate_conversions SET status = 'reversed' WHERE order_id = p_order_id;
+    ELSE
+      UPDATE public.agent_revenues SET
+        amount = amount - v_agent_refund,
+        updated_at = NOW()
+      WHERE id = v_agent_rev.id;
+      -- Mettre à jour la conversion avec le montant réduit
+      UPDATE public.affiliate_conversions SET
+        agent_commission_net = agent_commission_net - v_agent_refund,
+        status = 'partial_refund'
+      WHERE order_id = p_order_id;
+    END IF;
+
+    IF v_agent_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_rev.agent_id, 'debit', v_agent_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
-  -- Reverser le revenu plateforme
+  -- Reverser le revenu plateforme (pro-rata basé sur le remaining)
   SELECT * INTO v_platform_rev FROM public.platform_revenues WHERE order_id = p_order_id;
   IF v_platform_rev.id IS NOT NULL AND v_platform_rev.amount > 0 THEN
-    UPDATE public.platform_revenues SET locked = TRUE WHERE id = v_platform_rev.id;
-    PERFORM public.record_ledger_entry(v_group, p_order_id, 'platform_revenue', NULL, 'debit', v_platform_rev.amount, 'Refund reversal');
+    -- Même logique
+    IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
+      v_platform_refund := v_platform_rev.amount;
+    ELSE
+      v_platform_refund := ROUND(v_platform_rev.amount * v_refund_ratio, 2);
+    END IF;
+
+    IF v_refund_status = 'full' THEN
+      UPDATE public.platform_revenues SET locked = TRUE WHERE id = v_platform_rev.id;
+    ELSE
+      UPDATE public.platform_revenues SET
+        amount = amount - v_platform_refund
+      WHERE id = v_platform_rev.id;
+    END IF;
+
+    IF v_platform_refund > 0 THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'platform_revenue', NULL, 'debit', v_platform_refund,
+        CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
+    END IF;
   END IF;
 
   -- Mettre à jour la commande
-  UPDATE public.orders SET 
-    refund_status = v_refund_status, 
-    refund_amount = p_amount, 
+  UPDATE public.orders SET
+    refund_status = v_refund_status,
+    refund_amount = COALESCE(refund_amount, 0) + p_amount,
     refunded_at = NOW(),
-    status = 'refunded'
+    status = CASE WHEN v_refund_status = 'full' THEN 'refunded' ELSE status END
   WHERE id = p_order_id;
 
   -- Marquer comme complété
   UPDATE public.reverse_runs SET completed = TRUE, completed_at = NOW() WHERE order_id = p_order_id AND refund_id = p_refund_id;
 
-  RETURN jsonb_build_object('success', true, 'refund_status', v_refund_status);
+  RETURN jsonb_build_object(
+    'success', true,
+    'refund_status', v_refund_status,
+    'seller_refunded', v_seller_refund,
+    'agent_refunded', v_agent_refund,
+    'platform_refunded', v_platform_refund,
+    'total_refunded', v_total_previous_refunds + p_amount,
+    'remaining', v_order.total_amount - v_total_previous_refunds - p_amount
+  );
+END;
+$$;
+
+-- Créer une commande depuis une candidature acceptée (workflow offer)
+-- Appelée par le commerçant pour transformer une candidature en commande
+CREATE OR REPLACE FUNCTION public.create_order_from_application(
+  p_application_id UUID,
+  p_amount DECIMAL,
+  p_brief TEXT DEFAULT NULL,
+  p_delivery_days INTEGER DEFAULT 7
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_application public.global_offer_applications%ROWTYPE;
+  v_offer public.global_offers%ROWTYPE;
+  v_user_id UUID := auth.uid();
+  v_order_id UUID;
+  v_order_number TEXT;
+BEGIN
+  -- Récupérer l'application
+  SELECT * INTO v_application FROM public.global_offer_applications WHERE id = p_application_id;
+  IF v_application.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'APPLICATION_NOT_FOUND');
+  END IF;
+
+  -- Récupérer l'offre
+  SELECT * INTO v_offer FROM public.global_offers WHERE id = v_application.offer_id;
+  IF v_offer.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'OFFER_NOT_FOUND');
+  END IF;
+
+  -- Vérifier que l'utilisateur est l'auteur de l'offre (le merchant)
+  IF v_offer.author_id != v_user_id AND NOT public.is_admin() AND NOT public.is_service_role() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
+  END IF;
+
+  -- Vérifier que l'offre est ouverte
+  IF v_offer.status NOT IN ('open', 'in_progress') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'OFFER_NOT_OPEN');
+  END IF;
+
+  -- Vérifier que l'application n'est pas déjà sélectionnée
+  IF v_application.is_selected THEN
+    RETURN jsonb_build_object('success', false, 'error', 'APPLICATION_ALREADY_SELECTED');
+  END IF;
+
+  -- Vérifier le montant
+  IF p_amount <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_AMOUNT');
+  END IF;
+
+  -- Créer la commande (order_number auto-généré via DEFAULT)
+  INSERT INTO public.orders (
+    buyer_id,
+    seller_id,
+    global_offer_id,
+    order_type,
+    status,
+    subtotal,
+    total_amount,
+    brief,
+    delivery_deadline,
+    acceptance_deadline
+  ) VALUES (
+    v_offer.author_id,           -- Le merchant est l'acheteur
+    v_application.applicant_id,  -- Le candidat est le vendeur
+    v_offer.id,
+    'offer',
+    'pending',                   -- En attente d'acceptation par le vendeur
+    p_amount,
+    p_amount,
+    COALESCE(p_brief, v_offer.title || ' - ' || v_offer.description),
+    NOW() + (p_delivery_days || ' days')::INTERVAL,
+    NOW() + INTERVAL '48 hours'  -- 48h pour accepter
+  ) RETURNING id, order_number INTO v_order_id, v_order_number;
+
+  -- Marquer l'application comme sélectionnée
+  UPDATE public.global_offer_applications SET
+    is_selected = TRUE,
+    selected_at = NOW(),
+    status = 'accepted',
+    updated_at = NOW()
+  WHERE id = p_application_id;
+
+  -- Mettre à jour l'offre
+  UPDATE public.global_offers SET
+    selected_application_id = p_application_id,
+    resulting_order_id = v_order_id,
+    status = 'in_progress',
+    updated_at = NOW()
+  WHERE id = v_offer.id;
+
+  -- Logger dans l'historique
+  INSERT INTO public.order_status_history (order_id, old_status, new_status, changed_by, reason)
+  VALUES (v_order_id, NULL, 'pending', v_user_id, 'Order created from offer application');
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'order_id', v_order_id,
+    'order_number', v_order_number,
+    'seller_id', v_application.applicant_id,
+    'buyer_id', v_offer.author_id,
+    'amount', p_amount
+  );
+END;
+$$;
+
+-- Fonction pour qu'un candidat remplisse les snapshots lors de sa candidature
+CREATE OR REPLACE FUNCTION public.apply_to_offer(
+  p_offer_id UUID,
+  p_cover_letter TEXT DEFAULT NULL,
+  p_proposed_price DECIMAL DEFAULT NULL,
+  p_proposed_delivery_days INTEGER DEFAULT NULL
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_user_id UUID := auth.uid();
+  v_offer public.global_offers%ROWTYPE;
+  v_profile_snapshot JSONB;
+  v_portfolio_snapshot JSONB;
+  v_services_snapshot JSONB;
+  v_application_id UUID;
+BEGIN
+  -- Vérifier que l'utilisateur est connecté
+  IF v_user_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
+  END IF;
+
+  -- Récupérer l'offre
+  SELECT * INTO v_offer FROM public.global_offers WHERE id = p_offer_id;
+  IF v_offer.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'OFFER_NOT_FOUND');
+  END IF;
+
+  -- Vérifier que l'offre est ouverte
+  IF v_offer.status != 'open' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'OFFER_NOT_OPEN');
+  END IF;
+
+  -- Vérifier qu'on n'a pas déjà postulé
+  IF EXISTS (SELECT 1 FROM public.global_offer_applications WHERE offer_id = p_offer_id AND applicant_id = v_user_id) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'ALREADY_APPLIED');
+  END IF;
+
+  -- Vérifier KYC + Stripe (déjà vérifié par RLS, mais double-check)
+  IF NOT EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE id = v_user_id AND kyc_status = 'verified' AND stripe_onboarding_completed = TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'KYC_OR_STRIPE_NOT_VERIFIED');
+  END IF;
+
+  -- Vérifier que l'utilisateur a un rôle correspondant aux target_roles de l'offre
+  IF v_offer.target_roles IS NOT NULL AND array_length(v_offer.target_roles, 1) > 0 THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.user_roles ur
+      WHERE ur.user_id = v_user_id
+        AND ur.status = 'active'
+        AND ur.role = ANY(v_offer.target_roles)
+    ) THEN
+      RETURN jsonb_build_object('success', false, 'error', 'ROLE_NOT_MATCHING',
+        'required_roles', v_offer.target_roles);
+    END IF;
+  END IF;
+
+  -- Créer le snapshot du profil (WHITELIST: colonnes publiques uniquement, pas de row_to_json(*))
+  SELECT jsonb_build_object(
+    'username', p.username,
+    'display_name', p.display_name,
+    'bio', p.bio,
+    'avatar_url', p.avatar_url,
+    'city', p.city,
+    'country', p.country,
+    'is_verified', p.is_verified,
+    'average_rating', p.average_rating,
+    'total_reviews', p.total_reviews,
+    'completed_orders_count', p.completed_orders_count,
+    -- Freelance profile (colonnes publiques whitelistées)
+    'freelance', (SELECT jsonb_build_object(
+      'professional_title', fp.professional_title,
+      'tagline', fp.tagline,
+      'skills', fp.skills,
+      'experience_years', fp.experience_years,
+      'hourly_rate', fp.hourly_rate,
+      'availability_status', fp.availability_status
+    ) FROM public.freelance_profiles fp WHERE fp.user_id = v_user_id),
+    -- Influencer profile (colonnes publiques whitelistées)
+    'influencer', (SELECT jsonb_build_object(
+      'niche', ip.niche,
+      'content_types', ip.content_types,
+      'platforms', ip.platforms,
+      'collaboration_types', ip.collaboration_types,
+      'audience_size_total', ip.audience_size_total,
+      'engagement_rate', ip.engagement_rate,
+      'price_range_min', ip.price_range_min,
+      'price_range_max', ip.price_range_max
+    ) FROM public.influencer_profiles ip WHERE ip.user_id = v_user_id),
+    -- Social links (colonnes publiques uniquement)
+    'social_links', (SELECT jsonb_agg(jsonb_build_object(
+      'platform', sl.platform,
+      'username', sl.username,
+      'profile_url', sl.url,
+      'followers_count', sl.followers_count,
+      'is_verified', sl.is_verified
+    )) FROM public.social_links sl WHERE sl.user_id = v_user_id)
+  ) INTO v_profile_snapshot
+  FROM public.profiles p
+  WHERE p.id = v_user_id;
+
+  -- Créer le snapshot du portfolio (colonnes publiques whitelistées)
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', pi.id,
+    'title', pi.title,
+    'description', pi.description,
+    'media_type', pi.media_type,
+    'media_url', pi.media_url,
+    'thumbnail_url', pi.thumbnail_url,
+    'external_url', pi.external_url,
+    'category', pi.category,
+    'tags', pi.tags,
+    'is_featured', pi.is_featured
+  )), '[]'::jsonb) INTO v_portfolio_snapshot
+  FROM public.portfolio_items pi
+  WHERE pi.user_id = v_user_id AND pi.is_active = TRUE;
+
+  -- Créer le snapshot des services
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', s.id,
+    'title', s.title,
+    'description', LEFT(s.description, 500),
+    'base_price', s.base_price,
+    'service_role', s.service_role,
+    'rating_average', s.rating_average,
+    'total_orders', s.total_orders
+  )), '[]'::jsonb) INTO v_services_snapshot
+  FROM public.services s
+  WHERE s.seller_id = v_user_id AND s.status = 'active';
+
+  -- Créer la candidature
+  INSERT INTO public.global_offer_applications (
+    offer_id,
+    applicant_id,
+    cover_letter,
+    proposed_price,
+    proposed_delivery_days,
+    profile_snapshot,
+    portfolio_snapshot,
+    services_snapshot,
+    status
+  ) VALUES (
+    p_offer_id,
+    v_user_id,
+    p_cover_letter,
+    p_proposed_price,
+    p_proposed_delivery_days,
+    v_profile_snapshot,
+    v_portfolio_snapshot,
+    v_services_snapshot,
+    'pending'
+  ) RETURNING id INTO v_application_id;
+
+  -- Incrémenter le compteur de candidats
+  UPDATE public.global_offers SET applicants_count = applicants_count + 1, updated_at = NOW()
+  WHERE id = p_offer_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'application_id', v_application_id
+  );
 END;
 $$;
 
@@ -1398,39 +2010,81 @@ DECLARE
   v_available_agent DECIMAL;
   v_total_available DECIMAL;
   v_withdrawal_id UUID;
+  v_remaining DECIMAL;
+  v_revenue RECORD;
+  v_to_allocate DECIMAL;
 BEGIN
   IF v_user_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
   END IF;
-  
+
   IF p_amount < 5 THEN
     RETURN jsonb_build_object('success', false, 'error', 'MINIMUM_WITHDRAWAL_5_EUR');
   END IF;
-  
-  -- Calculer le solde disponible
-  SELECT COALESCE(SUM(amount), 0) INTO v_available_seller 
-  FROM public.seller_revenues 
+
+  -- Calculer le solde disponible (non verrouillé)
+  SELECT COALESCE(SUM(amount), 0) INTO v_available_seller
+  FROM public.seller_revenues
   WHERE seller_id = v_user_id AND status = 'available' AND locked = FALSE;
-  
-  SELECT COALESCE(SUM(amount), 0) INTO v_available_agent 
-  FROM public.agent_revenues 
+
+  SELECT COALESCE(SUM(amount), 0) INTO v_available_agent
+  FROM public.agent_revenues
   WHERE agent_id = v_user_id AND status = 'available' AND locked = FALSE;
-  
+
   v_total_available := v_available_seller + v_available_agent;
-  
+
   IF p_amount > v_total_available THEN
     RETURN jsonb_build_object('success', false, 'error', 'INSUFFICIENT_BALANCE', 'available', v_total_available);
   END IF;
-  
+
   -- Créer le retrait
   INSERT INTO public.withdrawals(user_id, amount, status)
   VALUES (v_user_id, p_amount, 'pending')
   RETURNING id INTO v_withdrawal_id;
-  
-  -- Verrouiller les revenus
-  UPDATE public.seller_revenues SET locked = TRUE WHERE seller_id = v_user_id AND status = 'available' AND locked = FALSE;
-  UPDATE public.agent_revenues SET locked = TRUE WHERE agent_id = v_user_id AND status = 'available' AND locked = FALSE;
-  
+
+  -- Allocation partielle: verrouiller seulement ce qui est nécessaire
+  v_remaining := p_amount;
+
+  -- 1) D'abord allouer depuis seller_revenues (FIFO par date)
+  FOR v_revenue IN
+    SELECT id, amount FROM public.seller_revenues
+    WHERE seller_id = v_user_id AND status = 'available' AND locked = FALSE
+    ORDER BY available_at ASC
+  LOOP
+    EXIT WHEN v_remaining <= 0;
+
+    v_to_allocate := LEAST(v_revenue.amount, v_remaining);
+
+    -- Créer l'allocation
+    INSERT INTO public.withdrawal_allocations(withdrawal_id, revenue_type, revenue_id, allocated_amount)
+    VALUES (v_withdrawal_id, 'seller', v_revenue.id, v_to_allocate);
+
+    -- Verrouiller la ligne de revenu
+    UPDATE public.seller_revenues SET locked = TRUE WHERE id = v_revenue.id;
+
+    v_remaining := v_remaining - v_to_allocate;
+  END LOOP;
+
+  -- 2) Ensuite allouer depuis agent_revenues si besoin
+  FOR v_revenue IN
+    SELECT id, amount FROM public.agent_revenues
+    WHERE agent_id = v_user_id AND status = 'available' AND locked = FALSE
+    ORDER BY available_at ASC
+  LOOP
+    EXIT WHEN v_remaining <= 0;
+
+    v_to_allocate := LEAST(v_revenue.amount, v_remaining);
+
+    -- Créer l'allocation
+    INSERT INTO public.withdrawal_allocations(withdrawal_id, revenue_type, revenue_id, allocated_amount)
+    VALUES (v_withdrawal_id, 'agent', v_revenue.id, v_to_allocate);
+
+    -- Verrouiller la ligne de revenu
+    UPDATE public.agent_revenues SET locked = TRUE WHERE id = v_revenue.id;
+
+    v_remaining := v_remaining - v_to_allocate;
+  END LOOP;
+
   RETURN jsonb_build_object('success', true, 'withdrawal_id', v_withdrawal_id, 'amount', p_amount);
 END;
 $$;
@@ -1497,46 +2151,47 @@ $$;
 -- 18. CRON FUNCTIONS
 -- ============================================================================
 
-CREATE OR REPLACE FUNCTION public.release_pending_revenues() 
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+CREATE OR REPLACE FUNCTION public.release_pending_revenues()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
-  UPDATE public.seller_revenues 
-  SET status = 'available', updated_at = NOW() 
+  UPDATE public.seller_revenues
+  SET status = 'available', updated_at = NOW()
   WHERE status = 'pending' AND available_at <= NOW() AND locked = FALSE;
-  
-  UPDATE public.agent_revenues 
-  SET status = 'available', updated_at = NOW() 
+
+  UPDATE public.agent_revenues
+  SET status = 'available', updated_at = NOW()
   WHERE status = 'pending' AND available_at <= NOW() AND locked = FALSE;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.auto_complete_orders() 
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+CREATE OR REPLACE FUNCTION public.auto_complete_orders()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
-  UPDATE public.orders 
+  UPDATE public.orders
   SET status = 'completed', completed_at = NOW(), updated_at = NOW()
   WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours';
-  
+
   -- Distribuer les commissions pour les commandes auto-complétées
-  PERFORM public.distribute_commissions(id) 
-  FROM public.orders 
+  -- NOTE: Double distribution impossible grâce à commission_runs (idempotence)
+  PERFORM public.distribute_commissions(id)
+  FROM public.orders
   WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute';
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.auto_cancel_expired_orders() 
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+CREATE OR REPLACE FUNCTION public.auto_cancel_expired_orders()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
-  UPDATE public.orders 
+  UPDATE public.orders
   SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
-  WHERE status = 'payment_authorized' 
-    AND acceptance_deadline IS NOT NULL 
+  WHERE status = 'payment_authorized'
+    AND acceptance_deadline IS NOT NULL
     AND acceptance_deadline < NOW();
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION public.cleanup_old_data() 
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+CREATE OR REPLACE FUNCTION public.cleanup_old_data()
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
 BEGIN
   DELETE FROM public.processed_webhooks WHERE processed_at < NOW() - INTERVAL '7 days';
   DELETE FROM public.rate_limits WHERE window_start < NOW() - INTERVAL '1 hour';
@@ -1649,13 +2304,108 @@ FROM public.profiles p
 WHERE p.deletion_requested_at IS NULL;
 
 CREATE OR REPLACE VIEW public.v_user_balance AS
-SELECT 
+SELECT
   p.id as user_id,
   COALESCE((SELECT SUM(amount) FROM public.seller_revenues WHERE seller_id = p.id AND status = 'pending'), 0) as seller_pending,
   COALESCE((SELECT SUM(amount) FROM public.seller_revenues WHERE seller_id = p.id AND status = 'available' AND locked = FALSE), 0) as seller_available,
   COALESCE((SELECT SUM(amount) FROM public.agent_revenues WHERE agent_id = p.id AND status = 'pending'), 0) as agent_pending,
   COALESCE((SELECT SUM(amount) FROM public.agent_revenues WHERE agent_id = p.id AND status = 'available' AND locked = FALSE), 0) as agent_available
 FROM public.profiles p;
+
+-- Vues publiques sécurisées pour les role-profiles (colonnes filtrées)
+CREATE OR REPLACE VIEW public.v_freelance_public AS
+SELECT
+  fp.user_id,
+  fp.professional_title,
+  fp.tagline,
+  fp.description,
+  fp.skills,
+  fp.languages,
+  fp.experience_years,
+  fp.hourly_rate,
+  fp.availability_status,
+  fp.response_time_hours,
+  fp.created_at
+FROM public.freelance_profiles fp
+JOIN public.profiles p ON p.id = fp.user_id
+WHERE p.deletion_requested_at IS NULL;
+
+CREATE OR REPLACE VIEW public.v_influencer_public AS
+SELECT
+  ip.user_id,
+  ip.niche,
+  ip.content_types,
+  ip.platforms,
+  ip.collaboration_types,
+  ip.audience_size_total,
+  ip.engagement_rate,
+  ip.social_platforms,  -- liens réseaux sociaux publics
+  ip.media_kit_url,
+  ip.price_range_min,
+  ip.price_range_max,
+  ip.created_at
+FROM public.influencer_profiles ip
+JOIN public.profiles p ON p.id = ip.user_id
+WHERE p.deletion_requested_at IS NULL;
+
+CREATE OR REPLACE VIEW public.v_merchant_public AS
+SELECT
+  mp.user_id,
+  mp.company_name,  -- nom public OK
+  mp.industry,
+  mp.company_size,
+  mp.website_url,
+  mp.description,
+  mp.created_at
+  -- Exclut: vat_number, legal_address, etc.
+FROM public.merchant_profiles mp
+JOIN public.profiles p ON p.id = mp.user_id
+WHERE p.deletion_requested_at IS NULL;
+
+CREATE OR REPLACE VIEW public.v_agent_public AS
+SELECT
+  ap.user_id,
+  ap.marketing_channels,
+  ap.audience_description,
+  ap.experience_level,
+  ap.created_at
+FROM public.agent_profiles ap
+JOIN public.profiles p ON p.id = ap.user_id
+WHERE p.deletion_requested_at IS NULL;
+
+-- Vue unifiée pour l'affichage des vendeurs (freelance + influencer)
+CREATE OR REPLACE VIEW public.v_seller_public AS
+SELECT
+  p.id as user_id,
+  p.username,
+  p.display_name,
+  p.bio,
+  p.avatar_url,
+  p.city,
+  p.country,
+  p.is_verified,
+  p.average_rating,
+  p.total_reviews,
+  p.completed_orders_count,
+  -- Freelance info
+  fp.professional_title,
+  fp.skills,
+  fp.experience_years,
+  fp.hourly_rate,
+  fp.availability_status,
+  -- Influencer info
+  ip.niche,
+  ip.audience_size_total,
+  ip.engagement_rate,
+  ip.platforms as influencer_platforms,
+  ip.content_types,
+  -- Roles actifs
+  ARRAY(SELECT ur.role FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.status = 'active') as active_roles
+FROM public.profiles p
+LEFT JOIN public.freelance_profiles fp ON fp.user_id = p.id
+LEFT JOIN public.influencer_profiles ip ON ip.user_id = p.id
+WHERE p.deletion_requested_at IS NULL
+  AND EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.role IN ('freelance', 'influencer') AND ur.status = 'active');
 
 -- ============================================================================
 -- 21. TRIGGERS (update_updated_at)
@@ -1744,7 +2494,13 @@ ALTER TABLE public.processed_webhooks ENABLE ROW LEVEL SECURITY;
 -- ============================================================================
 
 -- PROFILES
-CREATE POLICY "profiles_public_read" ON public.profiles FOR SELECT USING (true);
+-- SÉCURITÉ: La table profiles contient des données sensibles (email, phone, kyc_status, stripe_*)
+-- Les utilisateurs authentifiés NE DOIVENT PAS avoir accès direct à profiles d'autres users
+-- Utiliser v_profiles_public pour l'affichage public (colonnes filtrées)
+CREATE POLICY "profiles_owner_read" ON public.profiles FOR SELECT
+  USING (auth.uid() = id);  -- Un user peut SEULEMENT lire son propre profil complet
+CREATE POLICY "profiles_admin_read" ON public.profiles FOR SELECT
+  USING (public.is_admin() OR public.is_service_role());  -- Admins/service_role ont accès total
 CREATE POLICY "profiles_owner_update" ON public.profiles FOR UPDATE USING (auth.uid() = id);
 CREATE POLICY "profiles_owner_insert" ON public.profiles FOR INSERT WITH CHECK (auth.uid() = id);
 
@@ -1753,41 +2509,99 @@ CREATE POLICY "admins_admin_read" ON public.admins FOR SELECT USING (public.is_a
 CREATE POLICY "admins_service_write" ON public.admins FOR ALL USING (public.is_service_role());
 
 -- USER_ROLES
-CREATE POLICY "user_roles_public_read" ON public.user_roles FOR SELECT USING (true);
+-- SÉCURITÉ: Ne pas exposer tous les rôles de tous les utilisateurs
+-- Seul le owner peut voir/gérer ses rôles, admins peuvent voir
+CREATE POLICY "user_roles_owner_read" ON public.user_roles FOR SELECT
+  USING (auth.uid() = user_id OR public.is_admin() OR public.is_service_role());
 CREATE POLICY "user_roles_owner_manage" ON public.user_roles FOR ALL USING (auth.uid() = user_id);
 
 -- DASHBOARD_PREFERENCES
 CREATE POLICY "dashboard_prefs_owner" ON public.dashboard_preferences FOR ALL USING (auth.uid() = user_id);
 
 -- ROLE PROFILES (freelance, influencer, merchant, agent)
-CREATE POLICY "freelance_profiles_public_read" ON public.freelance_profiles FOR SELECT USING (true);
+-- SÉCURITÉ: Limiter les données exposées publiquement
+-- Les colonnes sensibles (company_name, vat_number, etc.) ne doivent pas être publiques
+
+-- Freelance: seul owner + admin peuvent lire toutes les colonnes
+-- Pour public: utiliser une vue v_freelance_public si nécessaire
+CREATE POLICY "freelance_profiles_owner_read" ON public.freelance_profiles FOR SELECT
+  USING (auth.uid() = user_id OR public.is_admin() OR public.is_service_role());
 CREATE POLICY "freelance_profiles_owner_manage" ON public.freelance_profiles FOR ALL USING (auth.uid() = user_id);
 
-CREATE POLICY "influencer_profiles_public_read" ON public.influencer_profiles FOR SELECT USING (true);
+-- Influencer: idem
+CREATE POLICY "influencer_profiles_owner_read" ON public.influencer_profiles FOR SELECT
+  USING (auth.uid() = user_id OR public.is_admin() OR public.is_service_role());
 CREATE POLICY "influencer_profiles_owner_manage" ON public.influencer_profiles FOR ALL USING (auth.uid() = user_id);
 
-CREATE POLICY "merchant_profiles_public_read" ON public.merchant_profiles FOR SELECT USING (true);
+-- Merchant: données business sensibles (vat, company)
+CREATE POLICY "merchant_profiles_owner_read" ON public.merchant_profiles FOR SELECT
+  USING (auth.uid() = user_id OR public.is_admin() OR public.is_service_role());
 CREATE POLICY "merchant_profiles_owner_manage" ON public.merchant_profiles FOR ALL USING (auth.uid() = user_id);
 
-CREATE POLICY "agent_profiles_public_read" ON public.agent_profiles FOR SELECT USING (true);
+-- Agent: idem
+CREATE POLICY "agent_profiles_owner_read" ON public.agent_profiles FOR SELECT
+  USING (auth.uid() = user_id OR public.is_admin() OR public.is_service_role());
 CREATE POLICY "agent_profiles_owner_manage" ON public.agent_profiles FOR ALL USING (auth.uid() = user_id);
 
 -- SOCIAL_LINKS
-CREATE POLICY "social_links_public_read" ON public.social_links FOR SELECT USING (true);
+-- Social links publics uniquement pour les influenceurs (les freelances gardent les leurs privés)
+CREATE POLICY "social_links_public_read" ON public.social_links FOR SELECT USING (
+  auth.uid() = user_id  -- Owner peut toujours voir les siens
+  OR public.is_admin()
+  OR public.is_service_role()
+  -- Public seulement si l'utilisateur est influenceur
+  OR EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = social_links.user_id
+      AND ur.role = 'influencer'
+      AND ur.status = 'active'
+  )
+);
 CREATE POLICY "social_links_owner_manage" ON public.social_links FOR ALL USING (auth.uid() = user_id);
 
 -- CREATOR_CODES
-CREATE POLICY "creator_codes_public_read" ON public.creator_codes FOR SELECT USING (is_active = TRUE);
-CREATE POLICY "creator_codes_owner_read" ON public.creator_codes FOR SELECT USING (auth.uid() = user_id);
-CREATE POLICY "creator_codes_service_manage" ON public.creator_codes FOR ALL USING (public.is_service_role());
+-- Pas de lecture publique listable (anti-scraping)
+-- La résolution se fait uniquement via resolve_creator_code() qui est SECURITY DEFINER
+CREATE POLICY "creator_codes_owner_read" ON public.creator_codes FOR SELECT
+  USING (auth.uid() = user_id);
+CREATE POLICY "creator_codes_admin_read" ON public.creator_codes FOR SELECT
+  USING (public.is_admin() OR public.is_service_role());
+CREATE POLICY "creator_codes_service_manage" ON public.creator_codes FOR ALL
+  USING (public.is_service_role());
 
 -- CATEGORIES
 CREATE POLICY "categories_public_read" ON public.categories FOR SELECT USING (is_active = TRUE);
 CREATE POLICY "categories_admin_manage" ON public.categories FOR ALL USING (public.is_admin() OR public.is_service_role());
 
 -- SERVICES
-CREATE POLICY "services_public_read" ON public.services FOR SELECT USING (status = 'active' OR auth.uid() = seller_id OR public.is_admin());
-CREATE POLICY "services_seller_insert" ON public.services FOR INSERT WITH CHECK (auth.uid() = seller_id);
+-- SÉCURITÉ: Pour INSERT, vérifier que le seller a le rôle correspondant (influencer/freelance)
+-- et que son KYC est vérifié + Stripe onboarding complété (pour publier/encaisser)
+CREATE POLICY "services_public_read" ON public.services FOR SELECT USING (
+  status = 'active'
+  OR auth.uid() = seller_id
+  OR public.is_admin()
+  OR public.is_service_role()
+);
+CREATE POLICY "services_seller_insert" ON public.services FOR INSERT WITH CHECK (
+  auth.uid() = seller_id
+  -- Vérifier que le seller a le rôle correspondant au service_role
+  AND EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = auth.uid()
+      AND ur.role = NEW.service_role  -- influencer ou freelance selon service
+      AND ur.status = 'active'
+  )
+  -- KYC et Stripe requis pour publier (status != draft)
+  AND (
+    NEW.status = 'draft'  -- Brouillon toujours autorisé
+    OR EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid()
+        AND p.kyc_status = 'verified'
+        AND p.stripe_onboarding_completed = TRUE
+    )
+  )
+);
 CREATE POLICY "services_seller_update" ON public.services FOR UPDATE USING (auth.uid() = seller_id OR public.is_admin());
 CREATE POLICY "services_seller_delete" ON public.services FOR DELETE USING (auth.uid() = seller_id OR public.is_admin());
 
@@ -1840,18 +2654,46 @@ CREATE POLICY "service_tags_seller_manage" ON public.service_tags FOR ALL USING 
 );
 
 -- GLOBAL_OFFERS
-CREATE POLICY "global_offers_public_read" ON public.global_offers FOR SELECT USING (status = 'open' OR auth.uid() = author_id OR public.is_admin());
-CREATE POLICY "global_offers_author_insert" ON public.global_offers FOR INSERT WITH CHECK (auth.uid() = author_id);
+-- SÉCURITÉ: Seuls les merchants peuvent créer des appels d'offres
+CREATE POLICY "global_offers_public_read" ON public.global_offers FOR SELECT
+  USING (status IN ('open', 'in_progress') OR auth.uid() = author_id OR public.is_admin());
+CREATE POLICY "global_offers_author_insert" ON public.global_offers FOR INSERT WITH CHECK (
+  auth.uid() = author_id
+  -- Vérifier que l'auteur a le rôle merchant actif
+  AND EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = auth.uid()
+      AND ur.role = 'merchant'
+      AND ur.status = 'active'
+  )
+);
 CREATE POLICY "global_offers_author_update" ON public.global_offers FOR UPDATE USING (auth.uid() = author_id OR public.is_admin());
 CREATE POLICY "global_offers_author_delete" ON public.global_offers FOR DELETE USING (auth.uid() = author_id OR public.is_admin());
 
 -- GLOBAL_OFFER_APPLICATIONS
+-- SÉCURITÉ: Pour postuler, l'utilisateur doit avoir KYC vérifié + Stripe onboarding
 CREATE POLICY "applications_parties_read" ON public.global_offer_applications FOR SELECT USING (
-  auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid())
+  auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid()) OR public.is_admin()
 );
-CREATE POLICY "applications_applicant_insert" ON public.global_offer_applications FOR INSERT WITH CHECK (auth.uid() = applicant_id);
+CREATE POLICY "applications_applicant_insert" ON public.global_offer_applications FOR INSERT WITH CHECK (
+  auth.uid() = applicant_id
+  -- KYC et Stripe requis pour postuler
+  AND EXISTS (
+    SELECT 1 FROM public.profiles p
+    WHERE p.id = auth.uid()
+      AND p.kyc_status = 'verified'
+      AND p.stripe_onboarding_completed = TRUE
+  )
+  -- Vérifier que l'utilisateur a le rôle approprié (influencer ou freelance)
+  AND EXISTS (
+    SELECT 1 FROM public.user_roles ur
+    WHERE ur.user_id = auth.uid()
+      AND ur.role IN ('influencer', 'freelance')
+      AND ur.status = 'active'
+  )
+);
 CREATE POLICY "applications_parties_update" ON public.global_offer_applications FOR UPDATE USING (
-  auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid())
+  auth.uid() = applicant_id OR EXISTS (SELECT 1 FROM public.global_offers o WHERE o.id = offer_id AND o.author_id = auth.uid()) OR public.is_admin()
 );
 
 -- PORTFOLIO_ITEMS
@@ -2010,7 +2852,8 @@ GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
 
 -- SELECT pour anon (lecture publique limitée par RLS)
-GRANT SELECT ON public.profiles TO anon;
+-- NOTE: public.profiles n'est PAS accordé à anon - utiliser v_profiles_public à la place
+-- Cela empêche l'exposition des colonnes sensibles (email, phone, kyc_status, stripe_*, etc.)
 GRANT SELECT ON public.categories TO anon;
 GRANT SELECT ON public.services TO anon;
 GRANT SELECT ON public.service_packages TO anon;
@@ -2019,10 +2862,61 @@ GRANT SELECT ON public.service_faqs TO anon;
 GRANT SELECT ON public.reviews TO anon;
 GRANT SELECT ON public.global_offers TO anon;
 GRANT SELECT ON public.v_services_public TO anon;
-GRANT SELECT ON public.v_profiles_public TO anon;
+GRANT SELECT ON public.v_profiles_public TO anon;  -- Vue sécurisée avec colonnes filtrées
+-- Nouvelles vues publiques pour les role-profiles
+GRANT SELECT ON public.v_freelance_public TO anon;
+GRANT SELECT ON public.v_influencer_public TO anon;
+GRANT SELECT ON public.v_merchant_public TO anon;
+GRANT SELECT ON public.v_agent_public TO anon;
+GRANT SELECT ON public.v_seller_public TO anon;
 
--- Grants pour authenticated
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO authenticated;
+-- Grants SELECT ciblés pour authenticated (au lieu de ALL TABLES)
+-- Principe: accès uniquement aux tables nécessaires, RLS fait le filtrage
+GRANT SELECT ON public.profiles TO authenticated;
+GRANT SELECT ON public.user_roles TO authenticated;
+GRANT SELECT ON public.dashboard_preferences TO authenticated;
+GRANT SELECT ON public.freelance_profiles TO authenticated;
+GRANT SELECT ON public.influencer_profiles TO authenticated;
+GRANT SELECT ON public.merchant_profiles TO authenticated;
+GRANT SELECT ON public.agent_profiles TO authenticated;
+GRANT SELECT ON public.social_links TO authenticated;
+GRANT SELECT ON public.categories TO authenticated;
+GRANT SELECT ON public.services TO authenticated;
+GRANT SELECT ON public.service_packages TO authenticated;
+GRANT SELECT ON public.service_media TO authenticated;
+GRANT SELECT ON public.service_faqs TO authenticated;
+GRANT SELECT ON public.service_requirements TO authenticated;
+GRANT SELECT ON public.service_extras TO authenticated;
+GRANT SELECT ON public.service_tags TO authenticated;
+GRANT SELECT ON public.global_offers TO authenticated;
+GRANT SELECT ON public.global_offer_applications TO authenticated;
+GRANT SELECT ON public.portfolio_items TO authenticated;
+GRANT SELECT ON public.affiliate_listings TO authenticated;
+GRANT SELECT ON public.affiliate_links TO authenticated;
+GRANT SELECT ON public.affiliate_conversions TO authenticated;
+GRANT SELECT ON public.orders TO authenticated;
+GRANT SELECT ON public.order_messages TO authenticated;
+GRANT SELECT ON public.order_status_history TO authenticated;
+GRANT SELECT ON public.disputes TO authenticated;
+GRANT SELECT ON public.reviews TO authenticated;
+GRANT SELECT ON public.seller_revenues TO authenticated;
+GRANT SELECT ON public.agent_revenues TO authenticated;
+GRANT SELECT ON public.withdrawals TO authenticated;
+GRANT SELECT ON public.bank_accounts TO authenticated;
+GRANT SELECT ON public.conversations TO authenticated;
+GRANT SELECT ON public.messages TO authenticated;
+GRANT SELECT ON public.notifications TO authenticated;
+-- Tables sensibles: PAS de GRANT SELECT pour authenticated
+-- (ledger_entries, platform_revenues, audit_logs, processed_webhooks, etc.)
+-- Vues publiques accessibles
+GRANT SELECT ON public.v_profiles_public TO authenticated;
+GRANT SELECT ON public.v_freelance_public TO authenticated;
+GRANT SELECT ON public.v_influencer_public TO authenticated;
+GRANT SELECT ON public.v_merchant_public TO authenticated;
+GRANT SELECT ON public.v_agent_public TO authenticated;
+GRANT SELECT ON public.v_seller_public TO authenticated;
+
+-- Grants INSERT/UPDATE/DELETE pour authenticated
 GRANT INSERT, UPDATE ON public.profiles TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON public.user_roles TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON public.dashboard_preferences TO authenticated;
@@ -2057,6 +2951,8 @@ GRANT INSERT ON public.contact_messages TO authenticated;
 GRANT EXECUTE ON FUNCTION public.resolve_creator_code(TEXT, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.validate_order_affiliate(UUID, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.update_order_status(UUID, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.create_order_from_application(UUID, DECIMAL, TEXT, INTEGER) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.apply_to_offer(UUID, TEXT, DECIMAL, INTEGER) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.request_withdrawal(DECIMAL) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.get_seller_stats(UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.get_agent_stats(UUID) TO authenticated;
