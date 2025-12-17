@@ -1,6 +1,28 @@
 -- ============================================================================
--- COLLABMARKET V40.7 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.8 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.8]
+-- BLOQUANTS MIGRATION CORRIGÉS:
+-- [FIX] job_queue: suppression du premier bloc dupliqué (table + fonctions)
+--       - Une seule définition reste (avec pg_temp et CTE pattern)
+-- [FIX] seller_revenues/agent_revenues: UNIQUE(order_id) retiré
+--       - request_withdrawal() peut splitter une ligne, UNIQUE bloquait cette logique
+-- [FIX] affiliate_conversions: FKs changées de ON DELETE SET NULL à ON DELETE RESTRICT
+--       - SET NULL sur colonnes NOT NULL = erreur SQL
+--       - RESTRICT préserve l'intégrité de l'audit trail
+-- [SEC] GRANT UPDATE orders: colonnes explicites uniquement
+--       - requirements_responses, seller_notes, brief, delivery_message, delivery_files
+--       - status/amounts modifiables UNIQUEMENT via SECURITY DEFINER
+-- [SEC] security_invoker = true sur toutes les vues
+--       - v_services_public, v_profiles_public, v_user_balance, v_freelance_public
+--       - v_influencer_public, v_merchant_public, v_agent_public, v_seller_public
+-- [AUDIT] auto_complete_orders() + auto_cancel_expired_orders(): INSERT order_status_history
+--       - Traçabilité complète des changements automatiques
+-- [SEC] Trigger immutabilité sur payment_logs (trg_payment_logs_immutable)
+--       - Réutilise prevent_ledger_modification()
+-- [SEC] services UPDATE: stripe_onboarding_completed requis pour status='active'
+--       - Cohérence avec la policy INSERT
+--
 -- [CHANGELOG V40.7]
 -- BLOQUANTS CORRIGÉS:
 -- [FIX] amounts_coherence: platform_fee retiré de la contrainte (c'est un split interne, pas facturé au buyer)
@@ -810,13 +832,15 @@ CREATE INDEX idx_affiliate_clicks_link ON public.affiliate_clicks(affiliate_link
 CREATE INDEX idx_affiliate_clicks_date ON public.affiliate_clicks(clicked_at);
 CREATE INDEX idx_affiliate_clicks_link_date ON public.affiliate_clicks(affiliate_link_id, clicked_at DESC);
 
+-- NOTE: FKs en RESTRICT pour préserver l'historique comptable (on ne peut pas supprimer
+-- un lien/agent/seller qui a des conversions - l'audit doit rester intact)
 CREATE TABLE public.affiliate_conversions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  affiliate_link_id UUID NOT NULL REFERENCES public.affiliate_links(id) ON DELETE SET NULL,
+  affiliate_link_id UUID NOT NULL REFERENCES public.affiliate_links(id) ON DELETE RESTRICT,
   order_id UUID NOT NULL UNIQUE,
-  agent_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE SET NULL,
-  seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-  buyer_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  agent_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
+  seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
+  buyer_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
   order_amount DECIMAL(10,2) NOT NULL CHECK (order_amount > 0),
   client_discount DECIMAL(10,2) DEFAULT 0 CHECK (client_discount >= 0),
   agent_commission_gross DECIMAL(10,2) DEFAULT 0 CHECK (agent_commission_gross >= 0),
@@ -1041,10 +1065,13 @@ CREATE TRIGGER trg_ledger_immutable
 BEFORE UPDATE OR DELETE ON public.ledger_entries 
 FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_modification();
 
+-- NOTE: order_id n'est PAS UNIQUE car request_withdrawal() peut splitter une ligne
+-- (ex: 100€ alloue 10€ → crée une 2e ligne pour les 90€ restants)
+-- L'idempotence de distribute_commissions() est gérée par commission_runs, pas ici
 CREATE TABLE public.seller_revenues (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   seller_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
-  order_id UUID UNIQUE REFERENCES public.orders(id) ON DELETE RESTRICT,
+  order_id UUID REFERENCES public.orders(id) ON DELETE RESTRICT,
   amount DECIMAL(10,2) NOT NULL CHECK (amount > 0),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'available', 'withdrawn', 'reversed')),
   locked BOOLEAN DEFAULT FALSE,
@@ -1057,10 +1084,11 @@ CREATE INDEX idx_seller_revenues_seller ON public.seller_revenues(seller_id);
 CREATE INDEX idx_seller_revenues_status ON public.seller_revenues(status);
 CREATE INDEX idx_seller_revenues_seller_available ON public.seller_revenues(seller_id, available_at ASC) WHERE status = 'available';
 
+-- NOTE: order_id n'est PAS UNIQUE (même raison que seller_revenues - split possible)
 CREATE TABLE public.agent_revenues (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE RESTRICT,
-  order_id UUID UNIQUE REFERENCES public.orders(id) ON DELETE RESTRICT,
+  order_id UUID REFERENCES public.orders(id) ON DELETE RESTRICT,
   affiliate_link_id UUID REFERENCES public.affiliate_links(id) ON DELETE SET NULL,
   amount DECIMAL(10,2) NOT NULL CHECK (amount > 0),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'available', 'withdrawn', 'reversed')),
@@ -1111,99 +1139,6 @@ CREATE TABLE public.withdrawal_allocations (
 );
 CREATE INDEX idx_withdrawal_allocations_withdrawal ON public.withdrawal_allocations(withdrawal_id);
 CREATE INDEX idx_withdrawal_allocations_revenue ON public.withdrawal_allocations(revenue_type, revenue_id);
-
--- ============================================================================
--- JOB QUEUE (traitement asynchrone pour performance)
--- ============================================================================
--- Pattern: enqueue rapide, traitement par worker (Edge Function cron ou externe)
-CREATE TABLE public.job_queue (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  job_type TEXT NOT NULL CHECK (job_type IN (
-    'distribute_commissions',
-    'reverse_commissions',
-    'send_notification',
-    'sync_analytics',
-    'process_webhook',
-    'cleanup_data'
-  )),
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-  priority INTEGER DEFAULT 0 CHECK (priority >= 0 AND priority <= 10),  -- 0=low, 10=urgent
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
-  attempts INTEGER DEFAULT 0 CHECK (attempts >= 0),
-  max_attempts INTEGER DEFAULT 3 CHECK (max_attempts >= 1),
-  last_error TEXT,
-  scheduled_at TIMESTAMPTZ DEFAULT NOW(),  -- Pour jobs différés
-  started_at TIMESTAMPTZ,
-  completed_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_job_queue_pending ON public.job_queue(status, priority DESC, scheduled_at ASC) WHERE status = 'pending';
-CREATE INDEX idx_job_queue_type ON public.job_queue(job_type, status);
-CREATE INDEX idx_job_queue_scheduled ON public.job_queue(scheduled_at) WHERE status = 'pending';
-
--- Fonction pour enqueue un job (utilisée par les autres fonctions)
-CREATE OR REPLACE FUNCTION public.enqueue_job(
-  p_job_type TEXT,
-  p_payload JSONB DEFAULT '{}'::jsonb,
-  p_priority INTEGER DEFAULT 5,
-  p_scheduled_at TIMESTAMPTZ DEFAULT NOW()
-) RETURNS UUID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
-DECLARE
-  v_job_id UUID;
-BEGIN
-  INSERT INTO public.job_queue (job_type, payload, priority, scheduled_at)
-  VALUES (p_job_type, p_payload, p_priority, p_scheduled_at)
-  RETURNING id INTO v_job_id;
-
-  RETURN v_job_id;
-END;
-$$;
-
--- Fonction pour récupérer le prochain job (appelée par worker)
-CREATE OR REPLACE FUNCTION public.claim_next_job(p_job_types TEXT[] DEFAULT NULL)
-RETURNS public.job_queue LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
-DECLARE
-  v_job public.job_queue;
-BEGIN
-  -- Sélectionner et verrouiller le prochain job
-  UPDATE public.job_queue
-  SET status = 'processing', started_at = NOW(), attempts = attempts + 1
-  WHERE id = (
-    SELECT id FROM public.job_queue
-    WHERE status = 'pending'
-      AND scheduled_at <= NOW()
-      AND (p_job_types IS NULL OR job_type = ANY(p_job_types))
-    ORDER BY priority DESC, scheduled_at ASC
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-  )
-  RETURNING * INTO v_job;
-
-  RETURN v_job;
-END;
-$$;
-
--- Fonction pour marquer un job comme terminé
-CREATE OR REPLACE FUNCTION public.complete_job(p_job_id UUID, p_success BOOLEAN, p_error TEXT DEFAULT NULL)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
-BEGIN
-  UPDATE public.job_queue
-  SET
-    status = CASE
-      WHEN p_success THEN 'completed'
-      WHEN attempts >= max_attempts THEN 'failed'
-      ELSE 'pending'  -- Retry
-    END,
-    completed_at = CASE WHEN p_success OR attempts >= max_attempts THEN NOW() ELSE NULL END,
-    last_error = p_error,
-    scheduled_at = CASE
-      WHEN NOT p_success AND attempts < max_attempts
-      THEN NOW() + (POWER(2, attempts) || ' minutes')::INTERVAL  -- Backoff exponentiel
-      ELSE scheduled_at
-    END
-  WHERE id = p_job_id;
-END;
-$$;
 
 CREATE TABLE public.commission_runs (
   order_id UUID PRIMARY KEY REFERENCES public.orders(id) ON DELETE CASCADE,
@@ -1490,6 +1425,11 @@ CREATE TABLE public.payment_logs (
 );
 CREATE INDEX idx_payment_logs_stripe ON public.payment_logs(stripe_event_id);
 CREATE INDEX idx_payment_logs_order ON public.payment_logs(order_id);
+
+-- Immutabilité: payment_logs ne peut pas être modifié/supprimé (audit Stripe)
+CREATE TRIGGER trg_payment_logs_immutable
+BEFORE UPDATE OR DELETE ON public.payment_logs
+FOR EACH ROW EXECUTE FUNCTION public.prevent_ledger_modification();
 
 CREATE TABLE public.contact_messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2557,22 +2497,26 @@ $$;
 CREATE OR REPLACE FUNCTION public.auto_complete_orders()
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
-  v_order_id UUID;
+  v_order RECORD;
 BEGIN
   -- Auto-compléter les commandes livrées depuis > 72h
-  UPDATE public.orders
-  SET status = 'completed', completed_at = NOW(), updated_at = NOW()
-  WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours';
-
-  -- Enqueue les jobs de distribution pour les commandes auto-complétées
-  -- NOTE: idempotence garantie par commission_runs dans distribute_commissions()
-  FOR v_order_id IN
-    SELECT id FROM public.orders
-    WHERE status = 'completed' AND completed_at >= NOW() - INTERVAL '1 minute'
+  -- Et enregistrer dans l'historique pour audit complet
+  FOR v_order IN
+    SELECT id, status FROM public.orders
+    WHERE status = 'delivered' AND delivered_at < NOW() - INTERVAL '72 hours'
   LOOP
-    -- Vérifier si pas déjà distribué avant d'enqueue
-    IF NOT EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = v_order_id AND completed = TRUE) THEN
-      PERFORM public.enqueue_job('distribute_commissions', jsonb_build_object('order_id', v_order_id), 8);
+    -- Enregistrer l'historique AVANT la transition
+    INSERT INTO public.order_status_history(order_id, old_status, new_status, changed_by, reason)
+    VALUES (v_order.id, v_order.status, 'completed', NULL, 'Auto-completion after 72h');
+
+    -- Mettre à jour la commande
+    UPDATE public.orders
+    SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+    WHERE id = v_order.id;
+
+    -- Enqueue la distribution si pas déjà faite
+    IF NOT EXISTS (SELECT 1 FROM public.commission_runs WHERE order_id = v_order.id AND completed = TRUE) THEN
+      PERFORM public.enqueue_job('distribute_commissions', jsonb_build_object('order_id', v_order.id), 8);
     END IF;
   END LOOP;
 END;
@@ -2580,12 +2524,26 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.auto_cancel_expired_orders()
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_order RECORD;
 BEGIN
-  UPDATE public.orders
-  SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
-  WHERE status = 'payment_authorized'
-    AND acceptance_deadline IS NOT NULL
-    AND acceptance_deadline < NOW();
+  -- Auto-annuler les commandes non acceptées après deadline
+  -- Et enregistrer dans l'historique pour audit complet
+  FOR v_order IN
+    SELECT id, status FROM public.orders
+    WHERE status = 'payment_authorized'
+      AND acceptance_deadline IS NOT NULL
+      AND acceptance_deadline < NOW()
+  LOOP
+    -- Enregistrer l'historique AVANT la transition
+    INSERT INTO public.order_status_history(order_id, old_status, new_status, changed_by, reason)
+    VALUES (v_order.id, v_order.status, 'cancelled', NULL, 'Auto-cancelled: acceptance deadline expired');
+
+    -- Mettre à jour la commande
+    UPDATE public.orders
+    SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+    WHERE id = v_order.id;
+  END LOOP;
 END;
 $$;
 
@@ -2816,6 +2774,17 @@ LEFT JOIN public.influencer_profiles ip ON ip.user_id = p.id
 WHERE p.deletion_requested_at IS NULL
   AND EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.role IN ('freelance', 'influencer') AND ur.status = 'active');
 
+-- SECURITY INVOKER sur toutes les vues (PG15+)
+-- Garantit que RLS du user appelant est appliqué, pas celui du owner de la vue
+ALTER VIEW public.v_services_public SET (security_invoker = true);
+ALTER VIEW public.v_profiles_public SET (security_invoker = true);
+ALTER VIEW public.v_user_balance SET (security_invoker = true);
+ALTER VIEW public.v_freelance_public SET (security_invoker = true);
+ALTER VIEW public.v_influencer_public SET (security_invoker = true);
+ALTER VIEW public.v_merchant_public SET (security_invoker = true);
+ALTER VIEW public.v_agent_public SET (security_invoker = true);
+ALTER VIEW public.v_seller_public SET (security_invoker = true);
+
 -- ============================================================================
 -- 21. TRIGGERS (update_updated_at)
 -- ============================================================================
@@ -3011,15 +2980,17 @@ CREATE POLICY "services_seller_insert" ON public.services FOR INSERT WITH CHECK 
     )
   )
 );
--- WITH CHECK: empêche de mettre status='active' sans KYC vérifié (sauf admin)
+-- WITH CHECK: empêche de mettre status='active' sans KYC vérifié ET Stripe onboardé (sauf admin)
 CREATE POLICY "services_seller_update" ON public.services FOR UPDATE
   USING (auth.uid() = seller_id OR public.is_admin())
   WITH CHECK (
     public.is_admin() OR (
-      -- Si le nouveau status est 'active', vérifier KYC
+      -- Si le nouveau status est 'active', vérifier KYC + Stripe onboarding
       status <> 'active' OR EXISTS (
         SELECT 1 FROM public.profiles p
-        WHERE p.id = auth.uid() AND p.kyc_status = 'verified'
+        WHERE p.id = auth.uid()
+          AND p.kyc_status = 'verified'
+          AND p.stripe_onboarding_completed = TRUE
       )
     )
   );
@@ -3380,7 +3351,9 @@ GRANT INSERT, UPDATE, DELETE ON public.global_offer_applications TO authenticate
 GRANT INSERT, UPDATE, DELETE ON public.portfolio_items TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON public.affiliate_listings TO authenticated;
 GRANT INSERT, UPDATE, DELETE ON public.affiliate_links TO authenticated;
-GRANT INSERT, UPDATE ON public.orders TO authenticated;
+GRANT INSERT ON public.orders TO authenticated;
+-- UPDATE restreint aux colonnes non-sensibles (status/montants passent par fonctions)
+GRANT UPDATE (requirements_responses, seller_notes, brief, delivery_message, delivery_files) ON public.orders TO authenticated;
 GRANT INSERT ON public.order_messages TO authenticated;
 GRANT INSERT ON public.disputes TO authenticated;
 GRANT INSERT, UPDATE ON public.reviews TO authenticated;
