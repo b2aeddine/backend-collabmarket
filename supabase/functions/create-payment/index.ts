@@ -1,7 +1,8 @@
 // ==============================================================================
-// CREATE-PAYMENT - V15.0 (SCHEMA V40 ALIGNED)
+// CREATE-PAYMENT - V15.1 (SCHEMA V40 ALIGNED)
 // Crée une commande et initialise le PaymentIntent Stripe (mode escrow)
 // ALIGNED: Uses buyer_id/seller_id, services/service_packages, amounts_coherence
+// SECURITY: Verifies seller role, KYC status, and Stripe onboarding
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -31,6 +32,9 @@ const paymentSchema = z.object({
   requirementsResponses: z.array(z.any()).optional(),
   selectedExtras: z.array(z.any()).optional(),
 });
+
+// Seller roles that can receive payments
+const SELLER_ROLES = ['influencer', 'freelance', 'merchant'];
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -120,6 +124,27 @@ serve(async (req) => {
       return corsErrorResponse("Seller not found", 404);
     }
 
+    // SECURITY: Verify seller has an active seller role
+    const { data: sellerRoles, error: rolesError } = await supabaseAdmin
+      .from("user_roles")
+      .select("role, status")
+      .eq("user_id", sellerId)
+      .eq("status", "active")
+      .in("role", SELLER_ROLES);
+
+    if (rolesError || !sellerRoles || sellerRoles.length === 0) {
+      return corsErrorResponse("Seller does not have an active seller role", 403);
+    }
+
+    // SECURITY: Verify seller has completed KYC (for amounts > threshold)
+    const KYC_THRESHOLD = 1000; // Require KYC for orders > 1000€
+    if (totalAmount > KYC_THRESHOLD) {
+      if (sellerProfile.kyc_status !== 'verified') {
+        return corsErrorResponse(`Orders over ${KYC_THRESHOLD}€ require seller KYC verification`, 400);
+      }
+    }
+
+    // SECURITY: Verify seller has completed Stripe onboarding
     if (!sellerProfile.stripe_account_id || !sellerProfile.stripe_onboarding_completed) {
       return corsErrorResponse("Seller has not completed Stripe onboarding", 400);
     }
