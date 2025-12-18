@@ -1,33 +1,31 @@
 // ==============================================================================
-// COMPLETE-ORDER - V14.0 (CORRECTED)
-// Finalise une commande - Le merchant confirme la livraison
-// NOTE: Remplace complete-order-and-pay ET complete-order-payment (doublons supprimés)
+// COMPLETE-ORDER - V15.0 (SCHEMA V40 ALIGNED)
+// Completes an order - The buyer confirms delivery acceptance
+// ALIGNED: Uses buyer_id/seller_id, safe_update_order_status RPC
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+import { corsHeaders, handleCorsOptions, corsResponse, corsErrorResponse } from "../shared/utils/cors.ts";
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return handleCorsOptions();
   }
 
   try {
     const { orderId } = await req.json();
     const authHeader = req.headers.get("Authorization");
 
-    if (!authHeader) throw new Error("Missing Authorization Header");
-    if (!orderId) throw new Error("Missing orderId");
+    if (!authHeader) {
+      return corsErrorResponse("Missing Authorization Header", 401);
+    }
 
-    // Init Client Supabase (Contexte Utilisateur)
+    if (!orderId) {
+      return corsErrorResponse("Missing orderId", 400);
+    }
+
+    // Init Client Supabase (User Context)
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_ANON_KEY")!,
@@ -35,49 +33,63 @@ serve(async (req) => {
     );
 
     const { data: { user }, error: authError } = await supabase.auth.getUser();
-    if (authError || !user) throw new Error("Unauthorized");
+    if (authError || !user) {
+      return corsErrorResponse("Unauthorized", 401);
+    }
 
-    // Récupération optimisée
+    // Fetch order with v40 schema columns
     const { data: order, error: orderError } = await supabase
       .from("orders")
-      .select("id, status, merchant_id, influencer_id, stripe_payment_status, total_amount, net_amount")
+      .select(`
+        id,
+        order_number,
+        status,
+        buyer_id,
+        seller_id,
+        stripe_payment_status,
+        total_amount,
+        subtotal,
+        discount_amount,
+        platform_fee
+      `)
       .eq("id", orderId)
       .single();
 
-    if (orderError || !order) throw new Error("Order not found");
+    if (orderError || !order) {
+      return corsErrorResponse("Order not found", 404);
+    }
 
-    // IDEMPOTENCE: Si déjà complété, retourner succès
+    // IDEMPOTENCE: If already completed, return success
     if (["completed", "finished"].includes(order.status)) {
       console.log(`Order ${orderId} already completed. Skipping.`);
-      return new Response(JSON.stringify({
+      return corsResponse({
         success: true,
         message: "Order already completed",
         status: order.status,
         alreadyProcessed: true,
-      }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-        status: 200,
       });
     }
 
-    // Seul le merchant peut compléter
-    if (order.merchant_id !== user.id) {
-      throw new Error("Unauthorized: Only the merchant can complete this order");
+    // SECURITY: Only the buyer can complete/accept the delivery
+    if (order.buyer_id !== user.id) {
+      return corsErrorResponse("Unauthorized: Only the buyer can complete this order", 403);
     }
 
-    // Vérification logique métier
-    const completableStatuses = ["submitted", "review_pending", "in_progress"];
+    // Business logic validation
+    const completableStatuses = ["submitted", "review_pending", "in_progress", "delivered"];
     if (!completableStatuses.includes(order.status)) {
-      throw new Error(`Cannot complete order. Influencer must submit work first (Current status: ${order.status})`);
+      return corsErrorResponse(
+        `Cannot complete order. Seller must submit work first (Current status: ${order.status})`,
+        400
+      );
     }
 
-    // FIX V20: Accepter "succeeded" en plus de "captured"
-    // Le webhook Stripe peut mettre l'un ou l'autre selon le timing
+    // Payment integrity check - funds must be captured
     if (!["captured", "succeeded"].includes(order.stripe_payment_status)) {
-      throw new Error("Payment integrity check failed: Funds not captured.");
+      return corsErrorResponse("Payment integrity check failed: Funds not captured.", 400);
     }
 
-    // Appel RPC (State Machine & Ledger)
+    // Call RPC (State Machine & Ledger) - this handles distribution automatically
     const { error: rpcError } = await supabase.rpc("safe_update_order_status", {
       p_order_id: orderId,
       p_new_status: "completed",
@@ -85,36 +97,34 @@ serve(async (req) => {
 
     if (rpcError) {
       console.error("RPC Error:", rpcError);
-      throw new Error(`Failed to complete order: ${rpcError.message}`);
+      return corsErrorResponse(`Failed to complete order: ${rpcError.message}`, 500);
     }
 
-    console.log(`Order ${orderId} completed successfully. Revenue generated.`);
+    console.log(`Order ${order.order_number || orderId} completed successfully.`);
 
-    return new Response(JSON.stringify({
+    // Calculate seller net (what they'll receive)
+    const sellerNet = order.total_amount - (order.platform_fee || 0);
+
+    return corsResponse({
       success: true,
       message: "Order successfully completed",
       status: "completed",
       data: {
         orderId: order.id,
+        orderNumber: order.order_number,
         amounts: {
           total: order.total_amount,
-          influencerNet: order.net_amount,
+          subtotal: order.subtotal,
+          discount: order.discount_amount,
+          platformFee: order.platform_fee,
+          sellerNet: sellerNet,
         },
       },
-    }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 200,
     });
 
   } catch (error: unknown) {
     const err = error as Error;
     console.error("Error in complete-order:", err);
-    return new Response(JSON.stringify({
-      success: false,
-      error: err.message,
-    }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 400,
-    });
+    return corsErrorResponse(err.message, 500);
   }
 });

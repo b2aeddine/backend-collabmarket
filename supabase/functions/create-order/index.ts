@@ -1,7 +1,8 @@
 // ==============================================================================
-// CREATE-ORDER - V15.0 (SCHEMA V40 ALIGNED)
+// CREATE-ORDER - V15.1 (SCHEMA V40 ALIGNED)
 // Creates an order and redirects to Stripe Checkout
 // ALIGNED: Uses buyer_id/seller_id, services/service_packages, amounts_coherence
+// SECURITY: Verifies seller role, KYC status, and Stripe onboarding
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -21,6 +22,9 @@ const orderSchema = z.object({
   packageId: z.string().uuid(),
   affiliateLinkCode: z.string().max(50).optional(),
 });
+
+// Seller roles that can receive payments
+const SELLER_ROLES = ['influencer', 'freelance', 'merchant'];
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -106,10 +110,10 @@ serve(async (req) => {
       return corsErrorResponse("Cannot purchase from yourself", 400);
     }
 
-    // 2. Verify seller has Stripe Connect ready
+    // 2. Verify seller exists, has proper role, and Stripe Connect ready
     const { data: sellerProfile, error: sellerError } = await supabaseAdmin
       .from("profiles")
-      .select("id, display_name, stripe_account_id, stripe_onboarding_completed")
+      .select("id, display_name, stripe_account_id, stripe_onboarding_completed, kyc_status")
       .eq("id", sellerId)
       .single();
 
@@ -117,6 +121,19 @@ serve(async (req) => {
       return corsErrorResponse("Seller not found", 404);
     }
 
+    // SECURITY: Verify seller has an active seller role
+    const { data: sellerRoles, error: rolesError } = await supabaseAdmin
+      .from("user_roles")
+      .select("role, status")
+      .eq("user_id", sellerId)
+      .eq("status", "active")
+      .in("role", SELLER_ROLES);
+
+    if (rolesError || !sellerRoles || sellerRoles.length === 0) {
+      return corsErrorResponse("Seller does not have an active seller role", 403);
+    }
+
+    // SECURITY: Verify seller has completed Stripe onboarding
     if (!sellerProfile.stripe_account_id || !sellerProfile.stripe_onboarding_completed) {
       return corsErrorResponse("Seller has not completed payment setup", 400);
     }
