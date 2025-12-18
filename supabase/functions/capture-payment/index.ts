@@ -1,104 +1,161 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-import Stripe from "https://esm.sh/stripe@14.21.0?target=deno";
-import { corsHeaders } from "../shared/utils/cors.ts";
+// ==============================================================================
+// CAPTURE-PAYMENT - V15.0 (SCHEMA V40 ALIGNED)
+// Captures an authorized payment - Seller accepts the order
+// ALIGNED: Uses seller_id, valid status 'accepted', safe_update_order_status RPC
+// ==============================================================================
 
-const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") as string, {
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import Stripe from "https://esm.sh/stripe@14.21.0";
+import { corsHeaders, handleCorsOptions, corsResponse, corsErrorResponse } from "../shared/utils/cors.ts";
+
+const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
   apiVersion: "2023-10-16",
   httpClient: Stripe.createFetchHttpClient(),
 });
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+    return handleCorsOptions();
   }
 
   try {
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL") ?? "",
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+    const { order_id } = await req.json();
+    const authHeader = req.headers.get("Authorization");
+
+    if (!authHeader) {
+      return corsErrorResponse("Missing Authorization Header", 401);
+    }
+
+    if (!order_id) {
+      return corsErrorResponse("Missing order_id", 400);
+    }
+
+    // Init Supabase clients
+    const supabaseUser = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } }
     );
 
-    // 1. AUTHENTICATION (User must be logged in)
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) throw new Error("Missing Authorization Header");
+    const supabaseAdmin = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
 
-    const { data: { user }, error: authError } = await supabase.auth.getUser(authHeader.replace("Bearer ", ""));
-    if (authError || !user) throw new Error("Unauthorized");
+    // Authenticate user
+    const { data: { user }, error: authError } = await supabaseUser.auth.getUser();
+    if (authError || !user) {
+      return corsErrorResponse("Unauthorized", 401);
+    }
 
-    const { order_id } = await req.json();
-    if (!order_id) throw new Error("Missing order_id");
-
-    // 2. FETCH ORDER & VALIDATE
-    const { data: order, error: orderError } = await supabase
+    // Fetch order (v40 schema: seller_id, not influencer_id)
+    const { data: order, error: orderError } = await supabaseUser
       .from("orders")
-      .select("*")
+      .select(`
+        id,
+        order_number,
+        status,
+        buyer_id,
+        seller_id,
+        stripe_payment_intent_id,
+        stripe_payment_status,
+        total_amount
+      `)
       .eq("id", order_id)
       .single();
 
-    if (orderError || !order) throw new Error("Order not found");
-
-    // 3. SECURITY CHECKS
-    // Only the Seller (Influencer) can accept/capture
-    if (order.influencer_id !== user.id) {
-      throw new Error("Unauthorized: Only the assigned influencer can accept this order.");
+    if (orderError || !order) {
+      return corsErrorResponse("Order not found", 404);
     }
 
-    // Strict Status Check
+    // SECURITY: Only the seller can accept/capture
+    if (order.seller_id !== user.id) {
+      return corsErrorResponse("Unauthorized: Only the seller can accept this order", 403);
+    }
+
+    // IDEMPOTENCE: If already accepted/in_progress, return success
+    if (["accepted", "in_progress", "delivered", "completed"].includes(order.status)) {
+      console.log(`[Capture] Order ${order_id} already accepted (status: ${order.status}). Skipping.`);
+      return corsResponse({
+        success: true,
+        message: "Order already accepted",
+        status: order.status,
+        alreadyProcessed: true,
+      });
+    }
+
+    // Status validation: Must be payment_authorized to capture
     if (order.status !== "payment_authorized") {
-      throw new Error(`Invalid status: Cannot capture order in state '${order.status}'. Must be 'payment_authorized'.`);
+      return corsErrorResponse(
+        `Invalid status: Cannot capture order in state '${order.status}'. Must be 'payment_authorized'.`,
+        400
+      );
     }
 
     if (!order.stripe_payment_intent_id) {
-      throw new Error("Missing Stripe Payment Intent ID");
+      return corsErrorResponse("Missing Stripe Payment Intent ID", 400);
     }
 
-    // 4. STRIPE CAPTURE
-    console.log(`[Capture] Capturing payment for order ${order_id} (PI: ${order.stripe_payment_intent_id})`);
+    // Stripe Capture
+    console.log(`[Capture] Capturing payment for order ${order.order_number} (PI: ${order.stripe_payment_intent_id})`);
 
     const paymentIntent = await stripe.paymentIntents.capture(order.stripe_payment_intent_id);
 
     if (paymentIntent.status !== "succeeded") {
-      throw new Error(`Stripe Capture Failed: Status is ${paymentIntent.status}`);
+      return corsErrorResponse(`Stripe Capture Failed: Status is ${paymentIntent.status}`, 500);
     }
 
-    // 5. UPDATE ORDER STATUS
-    // We update to 'accepted' or 'awaiting_delivery'. 
-    // The user workflow says: "L’influenceur a 48h pour accepter → si oui, Stripe capture le paiement"
-    // So status should be 'accepted' (or 'in_progress' / 'awaiting_delivery').
-    // Let's use 'awaiting_delivery' as per plan.
+    console.log(`[Capture] Payment captured successfully for order ${order.order_number}`);
 
-    const { error: updateError } = await supabase
+    // Update order status via atomic RPC
+    // v40 valid statuses: pending/payment_authorized/accepted/in_progress/delivered/revision_requested/completed/disputed/cancelled/refunded
+    // After capture, order goes to 'accepted' (seller has accepted the work)
+    const { error: rpcError } = await supabaseAdmin.rpc("safe_update_order_status", {
+      p_order_id: order_id,
+      p_new_status: "accepted",
+    });
+
+    if (rpcError) {
+      console.error("[Capture] RPC Error:", rpcError);
+      // Don't fail completely - payment was captured
+      // The webhook or sync will eventually fix the status
+    }
+
+    // Update stripe_payment_status directly (this should trigger sync_stripe_status_to_order if configured)
+    await supabaseAdmin
       .from("orders")
       .update({
-        status: "awaiting_delivery",
-        stripe_payment_status: "captured", // Sync immediately, webhook will confirm
+        stripe_payment_status: "captured",
         accepted_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
       })
       .eq("id", order_id);
 
-    if (updateError) throw updateError;
-
-    // 6. LOG AUDIT
-    await supabase.from("audit_logs").insert({
-      user_id: user.id,
-      event_name: "order_accepted_captured",
-      table_name: "orders",
-      record_id: order_id,
-      new_values: { status: "awaiting_delivery", stripe_status: "captured" }
+    // System log
+    await supabaseAdmin.from("system_logs").insert({
+      event_type: "info",
+      message: "Order accepted and payment captured",
+      details: {
+        order_id: order.id,
+        order_number: order.order_number,
+        seller_id: order.seller_id,
+        buyer_id: order.buyer_id,
+        amount: order.total_amount,
+        payment_intent: order.stripe_payment_intent_id,
+      },
     });
 
-    return new Response(JSON.stringify({ success: true, order_id }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 200,
+    return corsResponse({
+      success: true,
+      message: "Payment captured and order accepted",
+      orderId: order.id,
+      orderNumber: order.order_number,
+      status: "accepted",
     });
 
-  } catch (error) {
-    console.error(`Capture Error: ${error.message}`);
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 400,
-    });
+  } catch (error: unknown) {
+    const err = error as Error;
+    console.error("[Capture Error]:", err);
+    return corsErrorResponse(err.message, 500);
   }
 });

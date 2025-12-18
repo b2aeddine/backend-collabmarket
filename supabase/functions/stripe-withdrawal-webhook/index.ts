@@ -1,25 +1,18 @@
 // ==============================================================================
-// STRIPE-WITHDRAWAL-WEBHOOK - V21.0 (ATOMIC RPC)
-// Gère les webhooks Stripe Connect pour les payouts
-// SECURITY: Signature obligatoire + Idempotence + CORS restrictif
-// FIX: Utilise confirm_withdrawal_success pour éviter le double spending
+// STRIPE-WITHDRAWAL-WEBHOOK - V15.0 (SCHEMA V40 ALIGNED)
+// Handles Stripe Connect payout webhooks
+// SECURITY: Signature required + check_webhook_replay for idempotency
+// ALIGNED: Uses user_id (not influencer_id), correct RPC params
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, stripe-signature",
-};
+import { corsHeaders, handleCorsOptions } from "../shared/utils/cors.ts";
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return handleCorsOptions();
   }
 
   const supabase = createClient(
@@ -28,12 +21,12 @@ serve(async (req) => {
   );
 
   try {
-    // SECURITY: Signature obligatoire en production
+    // SECURITY: Signature required in production
     const signature = req.headers.get("stripe-signature");
     const webhookSecret = Deno.env.get("STRIPE_CONNECT_WEBHOOK_SECRET");
     const body = await req.text();
 
-    // SECURITY: Rejeter si pas de secret configuré
+    // SECURITY: Reject if no secret configured
     if (!webhookSecret) {
       console.error("CRITICAL: STRIPE_CONNECT_WEBHOOK_SECRET not configured");
       await supabase.from("system_logs").insert({
@@ -43,11 +36,11 @@ serve(async (req) => {
       });
       return new Response(JSON.stringify({ error: "Webhook not configured" }), {
         status: 500,
-        headers: corsHeaders,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // SECURITY: Rejeter si pas de signature
+    // SECURITY: Reject if no signature
     if (!signature) {
       console.error("SECURITY: Payout webhook request without stripe-signature header");
       await supabase.from("system_logs").insert({
@@ -57,7 +50,7 @@ serve(async (req) => {
       });
       return new Response(JSON.stringify({ error: "Missing signature" }), {
         status: 401,
-        headers: corsHeaders,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
@@ -66,7 +59,7 @@ serve(async (req) => {
       httpClient: Stripe.createFetchHttpClient(),
     });
 
-    // Vérification de signature
+    // Verify signature
     let event: Stripe.Event;
     try {
       event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
@@ -80,83 +73,88 @@ serve(async (req) => {
       });
       return new Response(JSON.stringify({ error: "Invalid signature" }), {
         status: 401,
-        headers: corsHeaders,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     console.log(`[Payout Webhook] Event: ${event.type}, ID: ${event.id}`);
 
-    // IDEMPOTENCE: Vérifier si l'événement a déjà été traité
-    const { data: existingLog } = await supabase
-      .from("payment_logs")
-      .select("id, processed")
-      .eq("stripe_payment_intent_id", event.id)
-      .eq("processed", true)
-      .maybeSingle();
+    // IDEMPOTENCY: Use check_webhook_replay RPC for atomic idempotency
+    const { data: isNewEvent, error: replayError } = await supabase.rpc("check_webhook_replay", {
+      p_event_id: event.id,
+      p_event_type: event.type,
+      p_payload_hash: null, // Payout webhooks don't need payload hash
+    });
 
-    if (existingLog) {
+    if (replayError) {
+      console.error("[Payout Webhook] check_webhook_replay error:", replayError);
+      // Continue anyway - let the status checks provide secondary idempotency
+    } else if (isNewEvent === false) {
       console.log(`[Payout Webhook] Event ${event.id} already processed, skipping.`);
-      return new Response(JSON.stringify({ received: true, skipped: true }), {
+      return new Response(JSON.stringify({ received: true, duplicate: true }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-
-    // Log l'événement (avant traitement)
-    const { data: logEntry } = await supabase
-      .from("payment_logs")
-      .insert({
-        event_type: event.type,
-        event_data: event.data.object as Record<string, unknown>,
-        stripe_payment_intent_id: event.id,
-        processed: false,
-      })
-      .select("id")
-      .single();
 
     switch (event.type) {
       case "payout.paid": {
         const payout = event.data.object as Stripe.Payout;
         const withdrawalId = payout.metadata?.withdrawal_id;
 
-        // Trouver le withdrawal
+        // Find withdrawal by ID or payout ID (v40 schema: user_id, not influencer_id)
         let withdrawal;
         if (withdrawalId) {
           const { data } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount, status")
+            .select("id, user_id, amount, status, stripe_payout_id")
             .eq("id", withdrawalId)
             .single();
           withdrawal = data;
         } else {
           const { data } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount, status")
+            .select("id, user_id, amount, status, stripe_payout_id")
             .eq("stripe_payout_id", payout.id)
             .single();
           withdrawal = data;
         }
 
         if (withdrawal) {
-          // IDEMPOTENCE: Vérifier si déjà traité
+          // IDEMPOTENCE: Check if already completed
           if (withdrawal.status === "completed") {
             console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} already completed, skipping.`);
             break;
           }
 
-          console.log(`[Webhook] Payout completed for withdrawal: ${withdrawal.id}`);
+          console.log(`[Payout Webhook] Payout completed for withdrawal: ${withdrawal.id}`);
 
-          // ATOMIC RPC CALL
+          // ATOMIC RPC CALL - Note: confirm_withdrawal_success requires p_payout_id
           const { error: rpcError } = await supabase.rpc("confirm_withdrawal_success", {
-            p_withdrawal_id: withdrawal.id
+            p_withdrawal_id: withdrawal.id,
+            p_payout_id: payout.id,
           });
 
           if (rpcError) {
             console.error("CRITICAL: Failed to confirm withdrawal success:", rpcError);
-            throw new Error("RPC confirm_withdrawal_success failed");
+            throw new Error(`RPC confirm_withdrawal_success failed: ${rpcError.message}`);
           }
 
-          console.log(`[Webhook] Withdrawal ${withdrawal.id} confirmed via Atomic RPC.`);
+          console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} confirmed via Atomic RPC.`);
+
+          // System log
+          await supabase.from("system_logs").insert({
+            event_type: "info",
+            message: "Withdrawal completed via webhook",
+            details: {
+              withdrawal_id: withdrawal.id,
+              user_id: withdrawal.user_id,
+              amount: withdrawal.amount,
+              payout_id: payout.id,
+            },
+          });
+        } else {
+          console.warn(`[Payout Webhook] No withdrawal found for payout ${payout.id}`);
         }
         break;
       }
@@ -170,14 +168,14 @@ serve(async (req) => {
         if (withdrawalId) {
           const { data } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount, status")
+            .select("id, user_id, amount, status")
             .eq("id", withdrawalId)
             .single();
           withdrawal = data;
         } else {
           const { data } = await supabase
             .from("withdrawals")
-            .select("id, influencer_id, amount, status")
+            .select("id, user_id, amount, status")
             .eq("stripe_payout_id", payout.id)
             .single();
           withdrawal = data;
@@ -189,15 +187,32 @@ serve(async (req) => {
             break;
           }
 
-          console.log(`[Webhook] Payout failed for withdrawal: ${withdrawal.id}`);
+          console.log(`[Payout Webhook] Payout failed for withdrawal: ${withdrawal.id}`);
 
           // ATOMIC RPC CALL
-          await supabase.rpc("confirm_withdrawal_failure", {
+          const { error: rpcError } = await supabase.rpc("confirm_withdrawal_failure", {
             p_withdrawal_id: withdrawal.id,
-            p_reason: failureMessage
+            p_reason: failureMessage,
           });
 
-          console.log(`[Webhook] Withdrawal ${withdrawal.id} marked as failed via Atomic RPC.`);
+          if (rpcError) {
+            console.error("Failed to mark withdrawal as failed:", rpcError);
+          }
+
+          console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} marked as failed via Atomic RPC.`);
+
+          // System log
+          await supabase.from("system_logs").insert({
+            event_type: "warning",
+            message: "Withdrawal failed via webhook",
+            details: {
+              withdrawal_id: withdrawal.id,
+              user_id: withdrawal.user_id,
+              amount: withdrawal.amount,
+              payout_id: payout.id,
+              reason: failureMessage,
+            },
+          });
         }
         break;
       }
@@ -207,7 +222,7 @@ serve(async (req) => {
 
         const { data: withdrawal } = await supabase
           .from("withdrawals")
-          .select("id, influencer_id, amount, status")
+          .select("id, user_id, amount, status")
           .eq("stripe_payout_id", payout.id)
           .single();
 
@@ -217,24 +232,22 @@ serve(async (req) => {
             break;
           }
 
-          await supabase.rpc("confirm_withdrawal_failure", {
+          const { error: rpcError } = await supabase.rpc("confirm_withdrawal_failure", {
             p_withdrawal_id: withdrawal.id,
-            p_reason: "Payout was canceled"
+            p_reason: "Payout was canceled",
           });
+
+          if (rpcError) {
+            console.error("Failed to mark withdrawal as cancelled:", rpcError);
+          }
+
+          console.log(`[Payout Webhook] Withdrawal ${withdrawal.id} marked as cancelled.`);
         }
         break;
       }
 
       default:
         console.log(`[Payout Webhook] Unhandled event: ${event.type}`);
-    }
-
-    // IDEMPOTENCE: Marquer l'événement comme traité
-    if (logEntry?.id) {
-      await supabase
-        .from("payment_logs")
-        .update({ processed: true })
-        .eq("id", logEntry.id);
     }
 
     return new Response(JSON.stringify({ received: true }), {
@@ -254,7 +267,7 @@ serve(async (req) => {
 
     return new Response(JSON.stringify({ error: err.message }), {
       status: 500,
-      headers: corsHeaders,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 });
