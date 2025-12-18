@@ -16,6 +16,8 @@
 -- [RPC] confirm_withdrawal_failure: Gestion échec retrait avec rollback
 -- [RPC] finalize_revenue_withdrawal: Marquage revenus comme retirés
 -- [RPC] revert_revenue_withdrawal: Annulation allocation revenus
+-- [PERF] aggregate_daily_stats(): range queries au lieu de DATE() pour index
+--       - search_path corrigé avec pg_temp
 --
 -- [CHANGELOG V40.8]
 -- BLOQUANTS MIGRATION CORRIGÉS:
@@ -1241,10 +1243,14 @@ CREATE INDEX idx_service_daily_stats_date ON public.service_daily_stats(stat_dat
 CREATE INDEX idx_service_daily_stats_service ON public.service_daily_stats(service_id, stat_date DESC);
 
 -- Fonction pour agréger les stats (appelée par cron quotidien)
+-- PERF: Utilise range queries au lieu de DATE() pour permettre l'utilisation des indexes
 CREATE OR REPLACE FUNCTION public.aggregate_daily_stats(p_date DATE DEFAULT CURRENT_DATE - 1)
-RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+DECLARE
+  v_start_ts TIMESTAMPTZ := p_date::TIMESTAMPTZ;
+  v_end_ts TIMESTAMPTZ := (p_date + 1)::TIMESTAMPTZ;
 BEGIN
-  -- Agrégation vendeurs
+  -- Agrégation vendeurs (range query pour index)
   INSERT INTO public.seller_daily_stats (seller_id, stat_date, orders_count, orders_completed, orders_revenue)
   SELECT
     seller_id,
@@ -1253,7 +1259,7 @@ BEGIN
     COUNT(*) FILTER (WHERE status = 'completed'),
     COALESCE(SUM(total_amount) FILTER (WHERE status = 'completed'), 0)
   FROM public.orders
-  WHERE DATE(created_at) = p_date
+  WHERE created_at >= v_start_ts AND created_at < v_end_ts
   GROUP BY seller_id
   ON CONFLICT (seller_id, stat_date)
   DO UPDATE SET
@@ -1262,7 +1268,7 @@ BEGIN
     orders_revenue = EXCLUDED.orders_revenue,
     updated_at = NOW();
 
-  -- Agrégation agents
+  -- Agrégation agents (range queries pour index)
   INSERT INTO public.agent_daily_stats (agent_id, stat_date, clicks_count, conversions_count, commission_net)
   SELECT
     al.agent_id,
@@ -1274,10 +1280,11 @@ BEGIN
   LEFT JOIN (
     SELECT affiliate_link_id, COUNT(*) as click_count
     FROM public.affiliate_clicks
-    WHERE DATE(clicked_at) = p_date
+    WHERE clicked_at >= v_start_ts AND clicked_at < v_end_ts
     GROUP BY affiliate_link_id
   ) ac ON ac.affiliate_link_id = al.id
-  LEFT JOIN public.affiliate_conversions conv ON conv.affiliate_link_id = al.id AND DATE(conv.confirmed_at) = p_date
+  LEFT JOIN public.affiliate_conversions conv ON conv.affiliate_link_id = al.id
+    AND conv.confirmed_at >= v_start_ts AND conv.confirmed_at < v_end_ts
   GROUP BY al.agent_id
   ON CONFLICT (agent_id, stat_date)
   DO UPDATE SET
