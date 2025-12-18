@@ -1,7 +1,8 @@
 // ==============================================================================
-// SYNC-REVENUES-WITH-STRIPE - V14.1 (SECURED)
-// Synchronise les revenus avec les données Stripe
+// SYNC-REVENUES-WITH-STRIPE - V15.0 (SCHEMA V40 ALIGNED)
+// Synchronizes revenue records with Stripe payment status
 // SECURITY: Uses CRON_SECRET instead of exposing service role key
+// ALIGNED: Uses seller_revenues table
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -35,13 +36,14 @@ serve(async (req) => {
       httpClient: Stripe.createFetchHttpClient(),
     });
 
-    // Récupérer les revenus 'pending' avec les commandes associées
+    // Fetch 'pending' seller revenues with associated orders
+    // v40 schema: seller_revenues with seller_id, order_id, status
     const { data: pendingRevenues, error: fetchError } = await supabase
-      .from("revenues")
+      .from("seller_revenues")
       .select(`
         id,
         order_id,
-        amount,
+        gross_amount,
         status,
         orders:order_id (
           stripe_payment_intent_id,
@@ -81,10 +83,10 @@ serve(async (req) => {
       try {
         const pi = await stripe.paymentIntents.retrieve(order.stripe_payment_intent_id);
 
-        // Si le paiement est capturé, le revenue devient disponible
+        // If payment is captured, revenue becomes available
         if (pi.status === "succeeded" && revenue.status === "pending") {
           await supabase
-            .from("revenues")
+            .from("seller_revenues")
             .update({
               status: "available",
               updated_at: new Date().toISOString(),
@@ -101,7 +103,7 @@ serve(async (req) => {
       }
     }
 
-    // Log système
+    // System log
     await supabase.from("system_logs").insert({
       event_type: "info",
       message: "Revenue sync completed",

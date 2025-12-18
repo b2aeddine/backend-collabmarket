@@ -1,6 +1,22 @@
 -- ============================================================================
--- COLLABMARKET V40.9 - PRODUCTION READY MULTI-ROLE SAAS EDITION (ALIGNED)
+-- COLLABMARKET V40.10 - PRODUCTION READY MULTI-ROLE SAAS EDITION (ALIGNED)
 -- ============================================================================
+-- [CHANGELOG V40.10]
+-- EDGE FUNCTIONS V15.0 ALIGNMENT:
+-- [RPC] record_affiliate_click: SECURITY DEFINER function for anonymous tracking
+--       - Allows anon users to record clicks via Edge Function
+--       - Validates link is active before recording
+--       - Returns success boolean
+-- [POLICY] affiliate_clicks_anon_insert: Allows INSERT via RPC only
+-- [SEC] All Edge Functions now use ip_hash (not raw IP) for GDPR compliance
+-- [SEC] track-affiliate-visit uses ANON key + RPC instead of SERVICE_ROLE
+-- [ALIGN] create-payment, create-order, stripe-webhook use v40 schema names:
+--       - buyer_id/seller_id (not merchant_id/influencer_id)
+--       - services/service_packages (not gigs/gig_packages)
+--       - processed_webhooks (not processed_events)
+--       - job_type: 'process_webhook' (not 'stripe_webhook')
+--       - amounts_coherence: total_amount = subtotal - discount_amount
+--
 -- [CHANGELOG V40.9]
 -- SCHEMA-CODE ALIGNMENT:
 -- [COMPAT] Vues de compatibilité pour Edge Functions:
@@ -4032,5 +4048,66 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.revert_revenue_withdrawal(UUID) TO service_role;
+
+-- ==============================================================================
+-- V40.10: record_affiliate_click RPC for anonymous tracking
+-- ==============================================================================
+-- This function allows the Edge Function to record affiliate clicks
+-- using the anon key instead of service_role key (security improvement)
+
+CREATE OR REPLACE FUNCTION public.record_affiliate_click(
+  p_link_id UUID,
+  p_ip_hash TEXT DEFAULT NULL,
+  p_user_agent TEXT DEFAULT NULL,
+  p_referer TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_link_active BOOLEAN;
+BEGIN
+  -- Verify link exists and is active
+  SELECT is_active INTO v_link_active
+  FROM public.affiliate_links
+  WHERE id = p_link_id;
+
+  IF v_link_active IS NULL THEN
+    -- Link doesn't exist
+    RETURN FALSE;
+  END IF;
+
+  IF NOT v_link_active THEN
+    -- Link is inactive
+    RETURN FALSE;
+  END IF;
+
+  -- Record the click
+  INSERT INTO public.affiliate_clicks (
+    affiliate_link_id,
+    ip_hash,
+    user_agent,
+    referer
+  ) VALUES (
+    p_link_id,
+    p_ip_hash,
+    LEFT(p_user_agent, 500),  -- Limit length
+    LEFT(p_referer, 2000)     -- Limit length
+  );
+
+  RETURN TRUE;
+EXCEPTION
+  WHEN OTHERS THEN
+    -- Log but don't fail for tracking
+    RETURN FALSE;
+END;
+$$;
+
+-- Grant to anon so Edge Function can call it without service_role
+GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO anon;
+GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO service_role;
 
 COMMIT;

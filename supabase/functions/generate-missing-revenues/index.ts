@@ -1,7 +1,8 @@
 // ==============================================================================
-// GENERATE-MISSING-REVENUES - V14.1 (SECURED)
-// Génère les revenus manquants pour les commandes complétées
+// GENERATE-MISSING-REVENUES - V15.0 (SCHEMA V40 ALIGNED)
+// Generates missing revenue records for completed orders
 // SECURITY: Uses CRON_SECRET instead of exposing service role key
+// ALIGNED: Uses seller_id, seller_revenues/agent_revenues tables
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -29,14 +30,15 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
 
-    // Trouver les commandes complétées sans revenue associé
+    // Find completed orders without seller_revenue record
+    // v40 schema: orders have buyer_id, seller_id, subtotal, discount_amount, total_amount, platform_fee
     const { data: ordersWithoutRevenue, error: fetchError } = await supabase
       .from("orders")
       .select(`
         id,
-        influencer_id,
+        seller_id,
         total_amount,
-        net_amount,
+        platform_fee,
         status,
         stripe_payment_status
       `)
@@ -58,11 +60,11 @@ serve(async (req) => {
       });
     }
 
-    // Vérifier lesquelles n'ont pas de revenue
+    // Check which orders don't have a seller_revenue record
     const orderIds = ordersWithoutRevenue.map(o => o.id);
-    
+
     const { data: existingRevenues } = await supabase
-      .from("revenues")
+      .from("seller_revenues")
       .select("order_id")
       .in("order_id", orderIds);
 
@@ -83,18 +85,25 @@ serve(async (req) => {
 
     console.log(`[Generate] Found ${missingOrders.length} orders without revenues`);
 
-    // Générer les revenues manquants
-    const revenuesToInsert = missingOrders.map(order => ({
-      influencer_id: order.influencer_id,
-      order_id: order.id,
-      amount: order.total_amount,
-      net_amount: order.net_amount,
-      commission: order.total_amount - order.net_amount,
-      status: "available",
-    }));
+    // Generate missing seller revenues
+    // v40 schema: seller_revenues has seller_id, order_id, gross_amount, net_amount, platform_fee, status
+    const revenuesToInsert = missingOrders.map(order => {
+      const grossAmount = order.total_amount || 0;
+      const platformFee = order.platform_fee || 0;
+      const netAmount = grossAmount - platformFee;
+
+      return {
+        seller_id: order.seller_id,
+        order_id: order.id,
+        gross_amount: grossAmount,
+        net_amount: netAmount,
+        platform_fee: platformFee,
+        status: "available", // Already captured, so available for withdrawal
+      };
+    });
 
     const { data: insertedRevenues, error: insertError } = await supabase
-      .from("revenues")
+      .from("seller_revenues")
       .insert(revenuesToInsert)
       .select();
 
@@ -104,12 +113,12 @@ serve(async (req) => {
     }
 
     const generatedCount = insertedRevenues?.length || 0;
-    console.log(`[Generate] Created ${generatedCount} revenues`);
+    console.log(`[Generate] Created ${generatedCount} seller revenues`);
 
     // Log système
     await supabase.from("system_logs").insert({
       event_type: "info",
-      message: "Generated missing revenues",
+      message: "Generated missing seller revenues",
       details: {
         ordersChecked: ordersWithoutRevenue.length,
         revenuesGenerated: generatedCount,
