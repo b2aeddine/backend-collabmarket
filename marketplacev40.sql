@@ -1,6 +1,22 @@
 -- ============================================================================
--- COLLABMARKET V40.8 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.9 - PRODUCTION READY MULTI-ROLE SAAS EDITION (ALIGNED)
 -- ============================================================================
+-- [CHANGELOG V40.9]
+-- SCHEMA-CODE ALIGNMENT:
+-- [COMPAT] Vues de compatibilité pour Edge Functions:
+--       - processed_events → processed_webhooks
+--       - offers → global_offers
+--       - gig_packages → service_packages
+--       - revenues → seller_revenues + agent_revenues (vue unifiée)
+--       - collabmarket_listings → services (vue filtrée)
+-- [TABLE] audit_orders: Table d'audit pour cleanup-orphan-orders
+-- [RPC] safe_update_order_status: Wrapper sécurisé avec historique
+-- [RPC] create_complete_gig: Création service + packages en une transaction
+-- [RPC] confirm_withdrawal_success: Finalisation retrait après payout
+-- [RPC] confirm_withdrawal_failure: Gestion échec retrait avec rollback
+-- [RPC] finalize_revenue_withdrawal: Marquage revenus comme retirés
+-- [RPC] revert_revenue_withdrawal: Annulation allocation revenus
+--
 -- [CHANGELOG V40.8]
 -- BLOQUANTS MIGRATION CORRIGÉS:
 -- [FIX] job_queue: suppression du premier bloc dupliqué (table + fonctions)
@@ -3605,5 +3621,409 @@ BEGIN
     ('Traduction FR ↔ EN', 'trad-fr-en', v_sc, 'flag', 1);
 
 END $$;
+
+-- ============================================================================
+-- COMPATIBILITY LAYER FOR EDGE FUNCTIONS
+-- Views and aliases to match Edge Function table references
+-- ============================================================================
+
+-- Edge Functions use "processed_events" but we have "processed_webhooks"
+CREATE OR REPLACE VIEW public.processed_events AS
+SELECT * FROM public.processed_webhooks;
+
+GRANT SELECT, INSERT ON public.processed_events TO authenticated, service_role;
+
+-- Edge Functions use "offers" but we have "global_offers"
+CREATE OR REPLACE VIEW public.offers AS
+SELECT * FROM public.global_offers;
+
+GRANT SELECT ON public.offers TO authenticated;
+GRANT ALL ON public.offers TO service_role;
+
+-- Edge Functions use "gig_packages" but we have "service_packages"
+CREATE OR REPLACE VIEW public.gig_packages AS
+SELECT * FROM public.service_packages;
+
+GRANT SELECT ON public.gig_packages TO authenticated;
+
+-- Edge Functions use "revenues" - unified view over seller/agent revenues
+CREATE OR REPLACE VIEW public.revenues AS
+SELECT
+  id,
+  seller_id AS influencer_id,  -- Edge Functions use influencer_id
+  order_id,
+  amount,
+  net_amount,
+  (amount - net_amount) AS commission,
+  status,
+  allocated_to_withdrawal,
+  withdrawal_id,
+  created_at,
+  updated_at,
+  'seller' AS revenue_type
+FROM public.seller_revenues
+UNION ALL
+SELECT
+  id,
+  agent_id AS influencer_id,
+  order_id,
+  amount,
+  net_amount,
+  (amount - net_amount) AS commission,
+  status,
+  allocated_to_withdrawal,
+  withdrawal_id,
+  created_at,
+  updated_at,
+  'agent' AS revenue_type
+FROM public.agent_revenues;
+
+GRANT SELECT ON public.revenues TO authenticated;
+GRANT ALL ON public.revenues TO service_role;
+
+-- audit_orders table for cleanup-orphan-orders
+CREATE TABLE IF NOT EXISTS public.audit_orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID REFERENCES public.orders(id) ON DELETE SET NULL,
+  old_status TEXT,
+  new_status TEXT,
+  notes TEXT,
+  changed_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE public.audit_orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "audit_orders_admin_read" ON public.audit_orders FOR SELECT USING (public.is_admin() OR public.is_service_role());
+CREATE POLICY "audit_orders_service_insert" ON public.audit_orders FOR INSERT WITH CHECK (public.is_service_role());
+
+-- collabmarket_listings - legacy gigs/services view for affiliate links
+CREATE OR REPLACE VIEW public.collabmarket_listings AS
+SELECT
+  s.id,
+  s.seller_id,
+  s.title,
+  s.description,
+  s.category_id,
+  s.status,
+  s.starting_price,
+  s.currency,
+  s.seller_type,
+  s.created_at,
+  s.updated_at,
+  'service' AS listing_type
+FROM public.services s
+WHERE s.status = 'active';
+
+GRANT SELECT ON public.collabmarket_listings TO authenticated;
+
+-- ============================================================================
+-- MISSING RPC FUNCTIONS FOR EDGE FUNCTIONS
+-- ============================================================================
+
+-- safe_update_order_status: Wrapper around update_order_status with safety checks
+CREATE OR REPLACE FUNCTION public.safe_update_order_status(
+  p_order_id UUID,
+  p_new_status TEXT,
+  p_reason TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_order RECORD;
+  v_user_id UUID := auth.uid();
+  v_is_admin BOOLEAN;
+BEGIN
+  -- Get current order
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Order not found';
+  END IF;
+
+  -- Check admin status
+  v_is_admin := public.is_admin();
+
+  -- Authorization check
+  IF NOT v_is_admin AND v_user_id IS DISTINCT FROM v_order.seller_id AND v_user_id IS DISTINCT FROM v_order.buyer_id THEN
+    RAISE EXCEPTION 'Unauthorized: Not a participant of this order';
+  END IF;
+
+  -- Record status change in history
+  INSERT INTO public.order_status_history(order_id, old_status, new_status, changed_by, reason)
+  VALUES (p_order_id, v_order.status, p_new_status, v_user_id, COALESCE(p_reason, 'Status updated via safe_update_order_status'));
+
+  -- Update the order
+  UPDATE public.orders
+  SET
+    status = p_new_status,
+    updated_at = NOW(),
+    cancelled_at = CASE WHEN p_new_status = 'cancelled' THEN NOW() ELSE cancelled_at END,
+    completed_at = CASE WHEN p_new_status = 'completed' THEN NOW() ELSE completed_at END
+  WHERE id = p_order_id;
+
+  RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.safe_update_order_status(UUID, TEXT, TEXT) TO authenticated;
+
+-- create_complete_gig: Creates a service with packages in one transaction
+CREATE OR REPLACE FUNCTION public.create_complete_gig(
+  p_title TEXT,
+  p_description TEXT,
+  p_category_id UUID,
+  p_packages JSONB,  -- Array of {name, description, price, delivery_days, revisions}
+  p_tags TEXT[] DEFAULT NULL,
+  p_requirements JSONB DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_user_id UUID := auth.uid();
+  v_service_id UUID;
+  v_package JSONB;
+  v_package_order INT := 1;
+BEGIN
+  -- Check user is verified
+  IF NOT EXISTS (
+    SELECT 1 FROM public.profiles
+    WHERE id = v_user_id
+      AND kyc_status = 'verified'
+      AND stripe_onboarding_completed = TRUE
+  ) THEN
+    RAISE EXCEPTION 'User must complete KYC and Stripe onboarding before creating services';
+  END IF;
+
+  -- Create the service
+  INSERT INTO public.services (
+    seller_id,
+    title,
+    description,
+    category_id,
+    status,
+    starting_price,
+    seller_type
+  )
+  VALUES (
+    v_user_id,
+    p_title,
+    p_description,
+    p_category_id,
+    'draft',  -- Start as draft
+    (p_packages->0->>'price')::DECIMAL,
+    COALESCE((SELECT seller_type FROM public.profiles WHERE id = v_user_id), 'freelance')
+  )
+  RETURNING id INTO v_service_id;
+
+  -- Create packages
+  FOR v_package IN SELECT * FROM jsonb_array_elements(p_packages)
+  LOOP
+    INSERT INTO public.service_packages (
+      service_id,
+      name,
+      description,
+      price,
+      delivery_days,
+      revisions,
+      sort_order
+    )
+    VALUES (
+      v_service_id,
+      v_package->>'name',
+      v_package->>'description',
+      (v_package->>'price')::DECIMAL,
+      (v_package->>'delivery_days')::INT,
+      COALESCE((v_package->>'revisions')::INT, 1),
+      v_package_order
+    );
+    v_package_order := v_package_order + 1;
+  END LOOP;
+
+  -- Add tags if provided
+  IF p_tags IS NOT NULL THEN
+    INSERT INTO public.service_tags (service_id, tag)
+    SELECT v_service_id, unnest(p_tags);
+  END IF;
+
+  -- Add requirements if provided
+  IF p_requirements IS NOT NULL THEN
+    INSERT INTO public.service_requirements (service_id, question, required)
+    SELECT
+      v_service_id,
+      req->>'question',
+      COALESCE((req->>'required')::BOOLEAN, TRUE)
+    FROM jsonb_array_elements(p_requirements) AS req;
+  END IF;
+
+  RETURN v_service_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.create_complete_gig(TEXT, TEXT, UUID, JSONB, TEXT[], JSONB) TO authenticated;
+
+-- confirm_withdrawal_success: Finalizes a withdrawal after successful payout
+CREATE OR REPLACE FUNCTION public.confirm_withdrawal_success(
+  p_withdrawal_id UUID,
+  p_payout_id TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- Update withdrawal status
+  UPDATE public.withdrawals
+  SET
+    status = 'completed',
+    stripe_payout_id = p_payout_id,
+    completed_at = NOW(),
+    updated_at = NOW()
+  WHERE id = p_withdrawal_id
+    AND status IN ('processing', 'approved');
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  -- Update allocated revenues to 'withdrawn'
+  UPDATE public.seller_revenues
+  SET status = 'withdrawn', updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  UPDATE public.agent_revenues
+  SET status = 'withdrawn', updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  -- Record ledger entry
+  PERFORM public.record_ledger_entry(
+    (SELECT user_id FROM public.withdrawals WHERE id = p_withdrawal_id),
+    'withdrawal_completed',
+    -(SELECT amount FROM public.withdrawals WHERE id = p_withdrawal_id),
+    'EUR',
+    p_withdrawal_id,
+    'Withdrawal completed: ' || p_payout_id
+  );
+
+  RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.confirm_withdrawal_success(UUID, TEXT) TO service_role;
+
+-- confirm_withdrawal_failure: Handles failed withdrawal
+CREATE OR REPLACE FUNCTION public.confirm_withdrawal_failure(
+  p_withdrawal_id UUID,
+  p_reason TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- Update withdrawal status
+  UPDATE public.withdrawals
+  SET
+    status = 'failed',
+    failure_reason = p_reason,
+    updated_at = NOW()
+  WHERE id = p_withdrawal_id
+    AND status IN ('processing', 'approved', 'pending');
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  -- Revert allocated revenues back to 'available'
+  UPDATE public.seller_revenues
+  SET
+    status = 'available',
+    allocated_to_withdrawal = FALSE,
+    withdrawal_id = NULL,
+    updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  UPDATE public.agent_revenues
+  SET
+    status = 'available',
+    allocated_to_withdrawal = FALSE,
+    withdrawal_id = NULL,
+    updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.confirm_withdrawal_failure(UUID, TEXT) TO service_role;
+
+-- finalize_revenue_withdrawal: Marks revenues as fully withdrawn
+CREATE OR REPLACE FUNCTION public.finalize_revenue_withdrawal(
+  p_withdrawal_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- Same as confirm_withdrawal_success but without the ledger entry
+  UPDATE public.seller_revenues
+  SET status = 'withdrawn', updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  UPDATE public.agent_revenues
+  SET status = 'withdrawn', updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  UPDATE public.withdrawals
+  SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+  WHERE id = p_withdrawal_id;
+
+  RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.finalize_revenue_withdrawal(UUID) TO service_role;
+
+-- revert_revenue_withdrawal: Reverts revenues when withdrawal fails
+CREATE OR REPLACE FUNCTION public.revert_revenue_withdrawal(
+  p_withdrawal_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  -- Revert allocated revenues back to 'available'
+  UPDATE public.seller_revenues
+  SET
+    status = 'available',
+    allocated_to_withdrawal = FALSE,
+    withdrawal_id = NULL,
+    updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  UPDATE public.agent_revenues
+  SET
+    status = 'available',
+    allocated_to_withdrawal = FALSE,
+    withdrawal_id = NULL,
+    updated_at = NOW()
+  WHERE withdrawal_id = p_withdrawal_id;
+
+  RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.revert_revenue_withdrawal(UUID) TO service_role;
 
 COMMIT;

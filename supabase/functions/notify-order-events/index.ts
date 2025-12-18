@@ -1,19 +1,14 @@
 // ==============================================================================
-// NOTIFY-ORDER-EVENTS - V14.0 (CORRECTED)
+// NOTIFY-ORDER-EVENTS - V14.1 (SECURED)
 // Envoie des notifications lors des changements de statut de commande
+// SECURITY: Requires CRON_SECRET or INTERNAL_SECRET - NOT publicly callable!
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
-
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+import { corsHeaders, handleCorsOptions } from "../shared/utils/cors.ts";
+import { verifyCronSecret } from "../shared/utils/auth.ts";
 
 // Validation schema
 const eventSchema = z.object({
@@ -22,8 +17,8 @@ const eventSchema = z.object({
 });
 
 // Templates de notification par événement
-const notificationTemplates: Record<string, { 
-  merchant?: { title: string; content: string }; 
+const notificationTemplates: Record<string, {
+  merchant?: { title: string; content: string };
   influencer?: { title: string; content: string };
 }> = {
   payment_authorized: {
@@ -80,10 +75,17 @@ const notificationTemplates: Record<string, {
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return handleCorsOptions();
   }
 
   try {
+    // SECURITY: Verify cron/internal secret - this endpoint writes to notifications!
+    const authError = verifyCronSecret(req);
+    if (authError) {
+      console.warn("[Notify Order Events] Unauthorized access attempt");
+      return authError;
+    }
+
     const body = await req.json();
 
     // Validation

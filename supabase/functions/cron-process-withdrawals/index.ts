@@ -1,20 +1,14 @@
 // ==============================================================================
-// CRON-PROCESS-WITHDRAWALS - V14.0 (CORRECTED)
+// CRON-PROCESS-WITHDRAWALS - V14.1 (SECURED)
 // Traite les retraits en batch (appelé par cron)
-// FIX: Typage correct des jointures
+// SECURITY: Uses CRON_SECRET instead of exposing service role key
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
-
-// SECURITY: CORS restrictif - configurable via env
-const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
+import { corsHeaders, handleCorsOptions } from "../shared/utils/cors.ts";
+import { verifyCronSecret } from "../shared/utils/auth.ts";
 
 // Types
 interface WithdrawalWithProfile {
@@ -37,16 +31,15 @@ interface ProcessResult {
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders });
+    return handleCorsOptions();
   }
 
   try {
-    // Vérification Service Role
-    const authHeader = req.headers.get("Authorization")?.replace("Bearer ", "");
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-    if (!authHeader || authHeader !== serviceKey) {
-      throw new Error("Unauthorized: Service role required");
+    // SECURITY: Verify cron secret instead of exposing service role key
+    const authError = verifyCronSecret(req);
+    if (authError) {
+      console.warn("[Cron Process Withdrawals] Unauthorized access attempt");
+      return authError;
     }
 
     console.log("[Cron Process Withdrawals] Starting batch processing...");
