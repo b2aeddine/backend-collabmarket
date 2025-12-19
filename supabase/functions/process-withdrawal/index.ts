@@ -1,15 +1,20 @@
 // ==============================================================================
-// PROCESS-WITHDRAWAL - V14.0 (CORRECTED)
+// PROCESS-WITHDRAWAL - V15.0 (SCHEMA V40.11 ALIGNED)
 // Traite une demande de retrait : Transfer + Payout
-// NOTE: Version unifiée remplaçant create-stripe-payout
+// FEATURES:
+// - Retry with exponential backoff on Stripe calls
+// - Alerting on failures
+// - Proper role check via user_roles table
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@14.21.0";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+import { withStripeRetry } from "../_shared/retry.ts";
+import { alertTransferFailure, alertWithdrawalFailure } from "../_shared/alerting.ts";
 
-// SECURITY: CORS restrictif - configurable via env
+// SECURITY: CORS restrictif
 const ALLOWED_ORIGIN = Deno.env.get("ALLOWED_ORIGIN") || "https://collabmarket.fr";
 
 const corsHeaders = {
@@ -19,13 +24,22 @@ const corsHeaders = {
 
 // Validation
 const withdrawalSchema = z.object({
-  amount: z.number().min(1, "Minimum withdrawal is 1€"),
+  amount: z.number().min(5, "Minimum withdrawal is 5€"),
 });
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  // Initialize admin client early for alerting
+  const supabaseAdmin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  let userId: string | undefined;
+  let withdrawalId: string | undefined;
 
   try {
     const body = await req.json();
@@ -41,27 +55,24 @@ serve(async (req) => {
 
     const { amount } = validation.data;
 
-    // Clients
+    // User client
     const supabaseUser = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_ANON_KEY")!,
       { global: { headers: { Authorization: authHeader } } }
     );
 
-    const supabaseAdmin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-    );
-
     const { data: { user }, error: authError } = await supabaseUser.auth.getUser();
     if (authError || !user) throw new Error("Unauthorized");
 
+    userId = user.id;
     console.log(`[Process Withdrawal] User: ${user.id}, Amount: ${amount}€`);
 
-    // Récupérer le profil avec le compte Stripe
+    // 1. GET PROFILE WITH STRIPE ACCOUNT
+    // -------------------------------------------------------------------------
     const { data: profile, error: profileError } = await supabaseAdmin
       .from("profiles")
-      .select("id, stripe_account_id, role")
+      .select("id, stripe_account_id, stripe_payouts_enabled")
       .eq("id", user.id)
       .single();
 
@@ -69,16 +80,28 @@ serve(async (req) => {
       throw new Error("Profile not found");
     }
 
-    if (profile.role !== "influenceur") {
-      throw new Error("Only influencers can request withdrawals");
+    // 2. CHECK USER HAS SELLER OR AGENT ROLE (v40 schema)
+    // -------------------------------------------------------------------------
+    const { data: roles, error: rolesError } = await supabaseAdmin
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", user.id)
+      .eq("status", "active")
+      .in("role", ["freelance", "influencer", "agent"]);
+
+    if (rolesError || !roles || roles.length === 0) {
+      throw new Error("You must be a seller or agent to request withdrawals");
     }
 
+    // 3. CHECK STRIPE ACCOUNT CONFIGURED
+    // -------------------------------------------------------------------------
     if (!profile.stripe_account_id) {
       throw new Error("No Stripe account configured. Please complete your Stripe setup first.");
     }
 
-    // Créer la demande de retrait via RPC (vérifie le solde)
-    const { data: withdrawalId, error: rpcError } = await supabaseUser.rpc("request_withdrawal", {
+    // 4. CREATE WITHDRAWAL REQUEST VIA RPC (checks balance)
+    // -------------------------------------------------------------------------
+    const { data: rpcResult, error: rpcError } = await supabaseUser.rpc("request_withdrawal", {
       p_amount: amount,
     });
 
@@ -86,115 +109,181 @@ serve(async (req) => {
       throw new Error(rpcError.message);
     }
 
-    console.log(`Withdrawal request created: ${withdrawalId}`);
+    // Handle different RPC return formats
+    if (typeof rpcResult === "object" && rpcResult !== null) {
+      if (rpcResult.success === false) {
+        throw new Error(rpcResult.error || "Withdrawal request failed");
+      }
+      withdrawalId = rpcResult.withdrawal_id;
+    } else {
+      withdrawalId = rpcResult;
+    }
 
-    // Init Stripe
+    console.log(`[Process Withdrawal] Request created: ${withdrawalId}`);
+
+    // 5. INIT STRIPE
+    // -------------------------------------------------------------------------
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
       apiVersion: "2023-10-16",
       httpClient: Stripe.createFetchHttpClient(),
     });
 
-    // Vérifier que le compte peut recevoir des payouts
-    const account = await stripe.accounts.retrieve(profile.stripe_account_id);
+    // 6. VERIFY STRIPE ACCOUNT CAN RECEIVE PAYOUTS (with retry)
+    // -------------------------------------------------------------------------
+    const account = await withStripeRetry(() =>
+      stripe.accounts.retrieve(profile.stripe_account_id!)
+    );
+
     if (!account.payouts_enabled) {
-      // Annuler le retrait
-      await supabaseAdmin
-        .from("withdrawals")
-        .update({ status: "failed", failure_reason: "Payouts not enabled on Stripe account" })
-        .eq("id", withdrawalId);
+      // Cancel withdrawal and release funds
+      await supabaseAdmin.rpc("confirm_withdrawal_failure", {
+        p_withdrawal_id: withdrawalId,
+        p_reason: "Payouts not enabled on Stripe account",
+      });
 
       throw new Error("Your Stripe account cannot receive payouts yet. Please complete your account setup.");
     }
 
-    // Mettre à jour le statut en 'processing'
+    // 7. UPDATE STATUS TO PROCESSING
+    // -------------------------------------------------------------------------
     await supabaseAdmin
       .from("withdrawals")
       .update({ status: "processing" })
       .eq("id", withdrawalId);
 
+    // 8. CREATE TRANSFER TO CONNECT ACCOUNT (with retry)
+    // -------------------------------------------------------------------------
+    let transfer: Stripe.Transfer;
     try {
-      // Étape 1: Transfer vers le compte Connect
-      const transfer = await stripe.transfers.create({
-        amount: Math.round(amount * 100),
-        currency: "eur",
-        destination: profile.stripe_account_id,
-        transfer_group: withdrawalId, // Link for reconciliation
-        metadata: {
-          withdrawal_id: withdrawalId,
-          user_id: user.id,
-        },
-      });
+      transfer = await withStripeRetry(() =>
+        stripe.transfers.create({
+          amount: Math.round(amount * 100), // Convert to cents
+          currency: "eur",
+          destination: profile.stripe_account_id!,
+          transfer_group: withdrawalId,
+          metadata: {
+            withdrawal_id: withdrawalId!,
+            user_id: user.id,
+          },
+        })
+      );
 
-      console.log(`Transfer created: ${transfer.id}`);
+      console.log(`[Process Withdrawal] Transfer created: ${transfer.id}`);
 
-      // Sauvegarder l'ID du transfer
+      // Save transfer ID
       await supabaseAdmin
         .from("withdrawals")
         .update({ stripe_transfer_id: transfer.id })
         .eq("id", withdrawalId);
 
-      // Étape 2: Payout vers le compte bancaire de l'influenceur
-      const payout = await stripe.payouts.create(
-        {
-          amount: Math.round(amount * 100),
-          currency: "eur",
-          metadata: {
-            withdrawal_id: withdrawalId,
-            user_id: user.id,
+    } catch (transferError: unknown) {
+      const err = transferError as Error;
+      console.error("[Process Withdrawal] Transfer failed:", err);
+
+      // Alert and fail withdrawal
+      await alertTransferFailure(supabaseAdmin, withdrawalId!, user.id, amount, err.message);
+
+      await supabaseAdmin.rpc("confirm_withdrawal_failure", {
+        p_withdrawal_id: withdrawalId,
+        p_reason: `Transfer failed: ${err.message}`,
+      });
+
+      throw new Error(`Transfer failed: ${err.message}`);
+    }
+
+    // 9. CREATE PAYOUT TO BANK ACCOUNT (with retry)
+    // -------------------------------------------------------------------------
+    let payout: Stripe.Payout;
+    try {
+      payout = await withStripeRetry(() =>
+        stripe.payouts.create(
+          {
+            amount: Math.round(amount * 100),
+            currency: "eur",
+            metadata: {
+              withdrawal_id: withdrawalId!,
+              user_id: user.id,
+              transfer_id: transfer.id,
+            },
           },
-        },
-        {
-          stripeAccount: profile.stripe_account_id,
-        }
+          {
+            stripeAccount: profile.stripe_account_id!,
+          }
+        )
       );
 
-      console.log(`Payout created: ${payout.id}`);
+      console.log(`[Process Withdrawal] Payout created: ${payout.id}`);
 
-      // Sauvegarder l'ID du payout
+      // Save payout ID
       await supabaseAdmin
         .from("withdrawals")
         .update({ stripe_payout_id: payout.id })
         .eq("id", withdrawalId);
 
-      // Le statut passera à 'completed' via webhook quand le payout sera effectif
+    } catch (payoutError: unknown) {
+      const err = payoutError as Error;
+      console.error("[Process Withdrawal] Payout failed:", err);
 
-      return new Response(JSON.stringify({
-        success: true,
-        withdrawalId,
-        transferId: transfer.id,
-        payoutId: payout.id,
-        status: "processing",
-        message: "Withdrawal initiated. You will be notified when funds reach your bank account.",
-      }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-        status: 200,
+      // Alert - funds are in transit, need manual intervention
+      await alertWithdrawalFailure(supabaseAdmin, withdrawalId!, `Payout failed after successful transfer: ${err.message}`, {
+        transfer_id: transfer.id,
+        user_id: user.id,
+        amount,
       });
 
-    } catch (stripeError: unknown) {
-      const err = stripeError as Error;
-      console.error("Stripe Error:", err);
-
-      // Marquer le retrait comme échoué
       await supabaseAdmin
         .from("withdrawals")
         .update({
           status: "failed",
-          failure_reason: err.message,
+          failure_reason: `Payout failed: ${err.message}. Transfer ${transfer.id} succeeded - manual intervention required.`,
         })
         .eq("id", withdrawalId);
 
-      throw new Error(`Stripe error: ${err.message}`);
+      throw new Error(`Payout failed: ${err.message}. Our team has been notified.`);
     }
+
+    // 10. SUCCESS - Status will change to 'completed' via webhook (payout.paid)
+    // -------------------------------------------------------------------------
+    return new Response(
+      JSON.stringify({
+        success: true,
+        withdrawal_id: withdrawalId,
+        transfer_id: transfer.id,
+        payout_id: payout.id,
+        status: "processing",
+        message: "Withdrawal initiated. You will be notified when funds reach your bank account.",
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 200,
+      }
+    );
 
   } catch (error: unknown) {
     const err = error as Error;
-    console.error("Error in process-withdrawal:", err);
-    return new Response(JSON.stringify({
-      success: false,
-      error: err.message,
-    }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-      status: 400,
-    });
+    console.error("[Process Withdrawal] Error:", err);
+
+    // Alert on unexpected errors (not validation errors)
+    if (
+      withdrawalId &&
+      !err.message.includes("Minimum") &&
+      !err.message.includes("must be") &&
+      !err.message.includes("Unauthorized")
+    ) {
+      await alertWithdrawalFailure(supabaseAdmin, withdrawalId, err.message, {
+        user_id: userId,
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: err.message,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 400,
+      }
+    );
   }
 });
