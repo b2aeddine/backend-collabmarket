@@ -1811,27 +1811,25 @@ BEGIN
   IF v_agent_net > 0 AND NOT v_is_fraud AND v_link.id IS NOT NULL THEN
     PERFORM public.record_ledger_entry(v_transaction_group_id, p_order_id, 'agent_wallet', v_link.agent_id, 'credit', v_agent_net, 'Agent commission');
     
-    INSERT INTO public.agent_revenues(agent_id, order_id, affiliate_link_id, amount, status, available_at) 
-    VALUES (v_link.agent_id, p_order_id, v_order.affiliate_link_id, v_agent_net, 'pending', NOW() + INTERVAL '72 hours') 
-    ON CONFLICT (order_id) DO NOTHING;
-    
+    -- NOTE: Pas de ON CONFLICT - idempotence garantie par commission_runs + advisory lock
+    INSERT INTO public.agent_revenues(agent_id, order_id, affiliate_link_id, amount, status, available_at)
+    VALUES (v_link.agent_id, p_order_id, v_order.affiliate_link_id, v_agent_net, 'pending', NOW() + INTERVAL '72 hours');
+
     INSERT INTO public.affiliate_conversions(affiliate_link_id, order_id, agent_id, seller_id, buyer_id, order_amount, agent_commission_gross, platform_cut_on_agent, agent_commission_net, platform_fee, seller_revenue, agent_commission_rate, platform_cut_rate, status, confirmed_at)
-    VALUES (v_order.affiliate_link_id, p_order_id, v_link.agent_id, v_order.seller_id, v_order.buyer_id, v_order.total_amount, v_agent_gross, v_platform_from_agent, v_agent_net, v_platform_amount, v_seller_amount, v_commission_rate, v_platform_cut_on_agent_rate, 'confirmed', NOW()) 
-    ON CONFLICT (order_id) DO NOTHING;
+    VALUES (v_order.affiliate_link_id, p_order_id, v_link.agent_id, v_order.seller_id, v_order.buyer_id, v_order.total_amount, v_agent_gross, v_platform_from_agent, v_agent_net, v_platform_amount, v_seller_amount, v_commission_rate, v_platform_cut_on_agent_rate, 'confirmed', NOW());
     
     UPDATE public.affiliate_links SET conversion_count = conversion_count + 1, total_revenue = total_revenue + v_order.total_amount WHERE id = v_order.affiliate_link_id;
     UPDATE public.creator_codes SET total_revenue = total_revenue + v_order.total_amount WHERE user_id = v_link.agent_id;
   END IF;
 
-  -- Revenu vendeur
-  INSERT INTO public.seller_revenues(seller_id, order_id, amount, status, available_at) 
-  VALUES (v_order.seller_id, p_order_id, v_seller_amount, 'pending', NOW() + INTERVAL '72 hours') 
-  ON CONFLICT (order_id) DO NOTHING;
-  
-  -- Revenu plateforme
-  INSERT INTO public.platform_revenues(order_id, amount, source) 
-  VALUES (p_order_id, v_platform_amount, 'platform_fee') 
-  ON CONFLICT (order_id) DO NOTHING;
+  -- Revenu vendeur (pas de ON CONFLICT - idempotence via commission_runs)
+  INSERT INTO public.seller_revenues(seller_id, order_id, amount, status, available_at)
+  VALUES (v_order.seller_id, p_order_id, v_seller_amount, 'pending', NOW() + INTERVAL '72 hours');
+
+  -- Revenu plateforme (order_id est UNIQUE sur platform_revenues)
+  INSERT INTO public.platform_revenues(order_id, amount, source)
+  VALUES (p_order_id, v_platform_amount, 'platform_fee')
+  ON CONFLICT (order_id) DO UPDATE SET amount = EXCLUDED.amount;
   
   -- Mise à jour commande
   UPDATE public.orders SET seller_revenue = v_seller_amount, platform_fee = v_platform_amount WHERE id = p_order_id;
@@ -1846,12 +1844,11 @@ END;
 $$;
 
 -- Reverse commissions (remboursement) - Supporte remboursements partiels avec pro-rata
+-- NOTE: Gère les revenus splittés par les withdrawals (multiples lignes par order_id)
 CREATE OR REPLACE FUNCTION public.reverse_commissions(p_order_id UUID, p_refund_id TEXT, p_amount DECIMAL)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE
   v_order public.orders%ROWTYPE;
-  v_seller_rev public.seller_revenues%ROWTYPE;
-  v_agent_rev public.agent_revenues%ROWTYPE;
   v_platform_rev public.platform_revenues%ROWTYPE;
   v_group UUID;
   v_refund_status TEXT := 'full';
@@ -1861,6 +1858,15 @@ DECLARE
   v_platform_refund DECIMAL := 0;
   v_total_previous_refunds DECIMAL := 0;
   v_remaining_amount DECIMAL;
+  -- Pour itérer sur les revenus splittés
+  v_rev RECORD;
+  v_to_reverse DECIMAL;
+  v_remaining_to_reverse DECIMAL;
+  v_seller_total_reversible DECIMAL;
+  v_agent_total_reversible DECIMAL;
+  v_seller_id UUID;
+  v_agent_id UUID;
+  v_withdrawn_amount DECIMAL := 0;
 BEGIN
   -- Advisory lock pour éviter race conditions entre workers
   PERFORM pg_advisory_xact_lock(hashtext(p_order_id::text));
@@ -1898,8 +1904,6 @@ BEGIN
   END IF;
 
   -- Calculer le ratio de remboursement
-  -- IMPORTANT: basé sur le montant RESTANT, pas le total original
-  -- Cela évite les erreurs d'arrondis cumulés lors de remboursements multiples
   IF v_remaining_amount > 0 THEN
     v_refund_ratio := p_amount / v_remaining_amount;
   ELSE
@@ -1909,69 +1913,131 @@ BEGIN
   INSERT INTO public.reverse_runs(order_id, refund_id, amount) VALUES (p_order_id, p_refund_id, p_amount);
   v_group := gen_random_uuid();
 
-  -- Reverser le revenu vendeur (pro-rata basé sur le remaining)
-  SELECT * INTO v_seller_rev FROM public.seller_revenues WHERE order_id = p_order_id;
-  IF v_seller_rev.id IS NOT NULL AND v_seller_rev.amount > 0 THEN
-    -- Si remboursement complet ou le ratio est 1 (tout le restant), prendre tout le montant restant
+  -- ==========================================================================
+  -- SELLER REVENUES: itérer sur TOUTES les lignes (gestion des splits)
+  -- ==========================================================================
+  -- Calculer le total réversible (pending + available, non locked, non withdrawn)
+  SELECT
+    COALESCE(SUM(amount), 0),
+    MAX(seller_id)  -- seller_id est le même pour toutes les lignes d'un order
+  INTO v_seller_total_reversible, v_seller_id
+  FROM public.seller_revenues
+  WHERE order_id = p_order_id
+    AND status IN ('pending', 'available')
+    AND locked = FALSE;
+
+  -- Calculer le montant déjà withdrawn (dette potentielle)
+  SELECT COALESCE(SUM(amount), 0) INTO v_withdrawn_amount
+  FROM public.seller_revenues
+  WHERE order_id = p_order_id AND status = 'withdrawn';
+
+  IF v_seller_total_reversible > 0 THEN
+    -- Calculer combien reverser (pro-rata du total réversible)
     IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
-      v_seller_refund := v_seller_rev.amount;
+      v_seller_refund := v_seller_total_reversible;
     ELSE
-      v_seller_refund := ROUND(v_seller_rev.amount * v_refund_ratio, 2);
+      v_seller_refund := ROUND(v_seller_total_reversible * v_refund_ratio, 2);
     END IF;
 
-    IF v_refund_status = 'full' THEN
-      -- Remboursement complet: marquer comme reversed
-      UPDATE public.seller_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_seller_rev.id;
-    ELSE
-      -- Remboursement partiel: réduire le montant disponible
-      UPDATE public.seller_revenues SET
-        amount = amount - v_seller_refund,
-        updated_at = NOW()
-      WHERE id = v_seller_rev.id;
-    END IF;
+    -- Itérer sur les lignes réversibles (FIFO par date de création)
+    v_remaining_to_reverse := v_seller_refund;
+    FOR v_rev IN
+      SELECT id, amount FROM public.seller_revenues
+      WHERE order_id = p_order_id
+        AND status IN ('pending', 'available')
+        AND locked = FALSE
+      ORDER BY created_at ASC
+    LOOP
+      EXIT WHEN v_remaining_to_reverse <= 0;
 
-    IF v_seller_refund > 0 THEN
-      PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_rev.seller_id, 'debit', v_seller_refund,
+      v_to_reverse := LEAST(v_rev.amount, v_remaining_to_reverse);
+
+      IF v_to_reverse >= v_rev.amount THEN
+        -- Reverser toute la ligne
+        UPDATE public.seller_revenues
+        SET status = 'reversed', locked = TRUE, updated_at = NOW()
+        WHERE id = v_rev.id;
+      ELSE
+        -- Reverser partiellement: réduire le montant
+        UPDATE public.seller_revenues
+        SET amount = amount - v_to_reverse, updated_at = NOW()
+        WHERE id = v_rev.id;
+      END IF;
+
+      v_remaining_to_reverse := v_remaining_to_reverse - v_to_reverse;
+    END LOOP;
+
+    IF v_seller_refund > 0 AND v_seller_id IS NOT NULL THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'seller_wallet', v_seller_id, 'debit', v_seller_refund,
         CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
     END IF;
   END IF;
 
-  -- Reverser le revenu agent (pro-rata basé sur le remaining)
-  SELECT * INTO v_agent_rev FROM public.agent_revenues WHERE order_id = p_order_id;
-  IF v_agent_rev.id IS NOT NULL AND v_agent_rev.amount > 0 THEN
-    -- Même logique: si complet ou ratio >= 1, prendre tout
+  -- ==========================================================================
+  -- AGENT REVENUES: même logique avec splits
+  -- ==========================================================================
+  SELECT
+    COALESCE(SUM(amount), 0),
+    MAX(agent_id)
+  INTO v_agent_total_reversible, v_agent_id
+  FROM public.agent_revenues
+  WHERE order_id = p_order_id
+    AND status IN ('pending', 'available')
+    AND locked = FALSE;
+
+  IF v_agent_total_reversible > 0 THEN
     IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
-      v_agent_refund := v_agent_rev.amount;
+      v_agent_refund := v_agent_total_reversible;
     ELSE
-      v_agent_refund := ROUND(v_agent_rev.amount * v_refund_ratio, 2);
+      v_agent_refund := ROUND(v_agent_total_reversible * v_refund_ratio, 2);
     END IF;
 
+    v_remaining_to_reverse := v_agent_refund;
+    FOR v_rev IN
+      SELECT id, amount FROM public.agent_revenues
+      WHERE order_id = p_order_id
+        AND status IN ('pending', 'available')
+        AND locked = FALSE
+      ORDER BY created_at ASC
+    LOOP
+      EXIT WHEN v_remaining_to_reverse <= 0;
+
+      v_to_reverse := LEAST(v_rev.amount, v_remaining_to_reverse);
+
+      IF v_to_reverse >= v_rev.amount THEN
+        UPDATE public.agent_revenues
+        SET status = 'reversed', locked = TRUE, updated_at = NOW()
+        WHERE id = v_rev.id;
+      ELSE
+        UPDATE public.agent_revenues
+        SET amount = amount - v_to_reverse, updated_at = NOW()
+        WHERE id = v_rev.id;
+      END IF;
+
+      v_remaining_to_reverse := v_remaining_to_reverse - v_to_reverse;
+    END LOOP;
+
+    -- Mettre à jour la conversion
     IF v_refund_status = 'full' THEN
-      UPDATE public.agent_revenues SET status = 'reversed', locked = TRUE, updated_at = NOW() WHERE id = v_agent_rev.id;
-      -- Marquer la conversion comme reversed
       UPDATE public.affiliate_conversions SET status = 'reversed' WHERE order_id = p_order_id;
     ELSE
-      UPDATE public.agent_revenues SET
-        amount = amount - v_agent_refund,
-        updated_at = NOW()
-      WHERE id = v_agent_rev.id;
-      -- Mettre à jour la conversion avec le montant réduit
       UPDATE public.affiliate_conversions SET
         agent_commission_net = agent_commission_net - v_agent_refund,
         status = 'partial_refund'
       WHERE order_id = p_order_id;
     END IF;
 
-    IF v_agent_refund > 0 THEN
-      PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_rev.agent_id, 'debit', v_agent_refund,
+    IF v_agent_refund > 0 AND v_agent_id IS NOT NULL THEN
+      PERFORM public.record_ledger_entry(v_group, p_order_id, 'agent_wallet', v_agent_id, 'debit', v_agent_refund,
         CASE WHEN v_refund_status = 'partial' THEN 'Partial refund reversal' ELSE 'Refund reversal' END);
     END IF;
   END IF;
 
-  -- Reverser le revenu plateforme (pro-rata basé sur le remaining)
+  -- ==========================================================================
+  -- PLATFORM REVENUE (order_id unique, pas de split)
+  -- ==========================================================================
   SELECT * INTO v_platform_rev FROM public.platform_revenues WHERE order_id = p_order_id;
   IF v_platform_rev.id IS NOT NULL AND v_platform_rev.amount > 0 THEN
-    -- Même logique
     IF v_refund_status = 'full' OR v_refund_ratio >= 1 THEN
       v_platform_refund := v_platform_rev.amount;
     ELSE
@@ -1981,9 +2047,7 @@ BEGIN
     IF v_refund_status = 'full' THEN
       UPDATE public.platform_revenues SET locked = TRUE WHERE id = v_platform_rev.id;
     ELSE
-      UPDATE public.platform_revenues SET
-        amount = amount - v_platform_refund
-      WHERE id = v_platform_rev.id;
+      UPDATE public.platform_revenues SET amount = amount - v_platform_refund WHERE id = v_platform_rev.id;
     END IF;
 
     IF v_platform_refund > 0 THEN
@@ -2010,7 +2074,8 @@ BEGIN
     'agent_refunded', v_agent_refund,
     'platform_refunded', v_platform_refund,
     'total_refunded', v_total_previous_refunds + p_amount,
-    'remaining', v_order.total_amount - v_total_previous_refunds - p_amount
+    'remaining', v_order.total_amount - v_total_previous_refunds - p_amount,
+    'warning', CASE WHEN v_withdrawn_amount > 0 THEN 'Some revenues already withdrawn - manual recovery may be needed' ELSE NULL END
   );
 END;
 $$;
@@ -3670,39 +3735,54 @@ SELECT * FROM public.service_packages;
 GRANT SELECT ON public.gig_packages TO authenticated;
 
 -- Edge Functions use "revenues" - unified view over seller/agent revenues
+-- NOTE: Joined with withdrawal_allocations to get allocation info
 CREATE OR REPLACE VIEW public.revenues AS
 SELECT
-  id,
-  seller_id AS influencer_id,  -- Edge Functions use influencer_id
-  order_id,
-  amount,
-  net_amount,
-  (amount - net_amount) AS commission,
-  status,
-  allocated_to_withdrawal,
-  withdrawal_id,
-  created_at,
-  updated_at,
-  'seller' AS revenue_type
-FROM public.seller_revenues
+  sr.id,
+  sr.seller_id AS influencer_id,  -- Legacy compat: Edge Functions use influencer_id
+  sr.order_id,
+  sr.amount,
+  sr.amount AS net_amount,  -- Compat: seller_revenues amount IS the net amount
+  0::DECIMAL AS commission,  -- Compat: commission was deducted before insertion
+  sr.status,
+  sr.locked AS allocated_to_withdrawal,  -- locked = allocated to a pending withdrawal
+  wa.withdrawal_id,
+  sr.available_at,
+  sr.withdrawn_at,
+  sr.created_at,
+  sr.updated_at,
+  'seller'::TEXT AS revenue_type
+FROM public.seller_revenues sr
+LEFT JOIN public.withdrawal_allocations wa
+  ON wa.revenue_type = 'seller' AND wa.revenue_id = sr.id
 UNION ALL
 SELECT
-  id,
-  agent_id AS influencer_id,
-  order_id,
-  amount,
-  net_amount,
-  (amount - net_amount) AS commission,
-  status,
-  allocated_to_withdrawal,
-  withdrawal_id,
-  created_at,
-  updated_at,
-  'agent' AS revenue_type
-FROM public.agent_revenues;
+  ar.id,
+  ar.agent_id AS influencer_id,
+  ar.order_id,
+  ar.amount,
+  ar.amount AS net_amount,
+  0::DECIMAL AS commission,
+  ar.status,
+  ar.locked AS allocated_to_withdrawal,
+  wa.withdrawal_id,
+  ar.available_at,
+  ar.withdrawn_at,
+  ar.created_at,
+  ar.updated_at,
+  'agent'::TEXT AS revenue_type
+FROM public.agent_revenues ar
+LEFT JOIN public.withdrawal_allocations wa
+  ON wa.revenue_type = 'agent' AND wa.revenue_id = ar.id;
 
 GRANT SELECT ON public.revenues TO authenticated;
 GRANT ALL ON public.revenues TO service_role;
+
+-- SECURITY INVOKER sur toutes les vues de compatibilité (RLS appliqué à l'appelant)
+ALTER VIEW public.processed_events SET (security_invoker = true);
+ALTER VIEW public.offers SET (security_invoker = true);
+ALTER VIEW public.gig_packages SET (security_invoker = true);
+ALTER VIEW public.revenues SET (security_invoker = true);
 
 -- audit_orders table for cleanup-orphan-orders
 CREATE TABLE IF NOT EXISTS public.audit_orders (
@@ -3738,6 +3818,7 @@ FROM public.services s
 WHERE s.status = 'active';
 
 GRANT SELECT ON public.collabmarket_listings TO authenticated;
+ALTER VIEW public.collabmarket_listings SET (security_invoker = true);
 
 -- ============================================================================
 -- MISSING RPC FUNCTIONS FOR EDGE FUNCTIONS
@@ -3900,7 +3981,15 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
+DECLARE
+  v_user_id UUID;
+  v_amount DECIMAL;
 BEGIN
+  -- Get withdrawal info
+  SELECT user_id, amount INTO v_user_id, v_amount
+  FROM public.withdrawals
+  WHERE id = p_withdrawal_id;
+
   -- Update withdrawal status
   UPDATE public.withdrawals
   SET
@@ -3915,20 +4004,26 @@ BEGIN
     RETURN FALSE;
   END IF;
 
-  -- Update allocated revenues to 'withdrawn'
-  UPDATE public.seller_revenues
-  SET status = 'withdrawn', updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  -- Update allocated revenues to 'withdrawn' using withdrawal_allocations
+  UPDATE public.seller_revenues sr
+  SET status = 'withdrawn', withdrawn_at = NOW(), updated_at = NOW()
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'seller'
+    AND wa.revenue_id = sr.id;
 
-  UPDATE public.agent_revenues
-  SET status = 'withdrawn', updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  UPDATE public.agent_revenues ar
+  SET status = 'withdrawn', withdrawn_at = NOW(), updated_at = NOW()
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'agent'
+    AND wa.revenue_id = ar.id;
 
   -- Record ledger entry
   PERFORM public.record_ledger_entry(
-    (SELECT user_id FROM public.withdrawals WHERE id = p_withdrawal_id),
+    v_user_id,
     'withdrawal_completed',
-    -(SELECT amount FROM public.withdrawals WHERE id = p_withdrawal_id),
+    -v_amount,
     'EUR',
     p_withdrawal_id,
     'Withdrawal completed: ' || p_payout_id
@@ -3964,22 +4059,29 @@ BEGIN
     RETURN FALSE;
   END IF;
 
-  -- Revert allocated revenues back to 'available'
-  UPDATE public.seller_revenues
+  -- Revert allocated revenues back to 'available' using withdrawal_allocations
+  UPDATE public.seller_revenues sr
   SET
     status = 'available',
-    allocated_to_withdrawal = FALSE,
-    withdrawal_id = NULL,
+    locked = FALSE,
     updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'seller'
+    AND wa.revenue_id = sr.id;
 
-  UPDATE public.agent_revenues
+  UPDATE public.agent_revenues ar
   SET
     status = 'available',
-    allocated_to_withdrawal = FALSE,
-    withdrawal_id = NULL,
+    locked = FALSE,
     updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'agent'
+    AND wa.revenue_id = ar.id;
+
+  -- Delete allocation records
+  DELETE FROM public.withdrawal_allocations WHERE withdrawal_id = p_withdrawal_id;
 
   RETURN TRUE;
 END;
@@ -3997,14 +4099,20 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- Same as confirm_withdrawal_success but without the ledger entry
-  UPDATE public.seller_revenues
-  SET status = 'withdrawn', updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  -- Mark revenues as withdrawn using withdrawal_allocations
+  UPDATE public.seller_revenues sr
+  SET status = 'withdrawn', withdrawn_at = NOW(), updated_at = NOW()
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'seller'
+    AND wa.revenue_id = sr.id;
 
-  UPDATE public.agent_revenues
-  SET status = 'withdrawn', updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  UPDATE public.agent_revenues ar
+  SET status = 'withdrawn', withdrawn_at = NOW(), updated_at = NOW()
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'agent'
+    AND wa.revenue_id = ar.id;
 
   UPDATE public.withdrawals
   SET status = 'completed', completed_at = NOW(), updated_at = NOW()
@@ -4026,22 +4134,29 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
-  -- Revert allocated revenues back to 'available'
-  UPDATE public.seller_revenues
+  -- Revert allocated revenues back to 'available' using withdrawal_allocations
+  UPDATE public.seller_revenues sr
   SET
     status = 'available',
-    allocated_to_withdrawal = FALSE,
-    withdrawal_id = NULL,
+    locked = FALSE,
     updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'seller'
+    AND wa.revenue_id = sr.id;
 
-  UPDATE public.agent_revenues
+  UPDATE public.agent_revenues ar
   SET
     status = 'available',
-    allocated_to_withdrawal = FALSE,
-    withdrawal_id = NULL,
+    locked = FALSE,
     updated_at = NOW()
-  WHERE withdrawal_id = p_withdrawal_id;
+  FROM public.withdrawal_allocations wa
+  WHERE wa.withdrawal_id = p_withdrawal_id
+    AND wa.revenue_type = 'agent'
+    AND wa.revenue_id = ar.id;
+
+  -- Delete allocation records
+  DELETE FROM public.withdrawal_allocations WHERE withdrawal_id = p_withdrawal_id;
 
   RETURN TRUE;
 END;
