@@ -161,35 +161,74 @@ serve(async (req) => {
       console.log("[Monitoring] auto_cancel_expired_orders completed");
     }
 
-    // 6. RETRY STUCK JOBS (processing for > 30 min)
+    // 6. RETRY STUCK JOBS (processing for > 60 min with careful handling)
     // -----------------------------------------------------------------------
     console.log("[Monitoring] Checking for stuck jobs...");
-    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
 
-    const { data: stuckJobs, error: stuckError } = await supabase
+    // Use longer timeout (60 min) and process one by one with audit trail
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+    // First, identify potentially stuck jobs
+    const { data: potentiallyStuckJobs, error: queryError } = await supabase
       .from("job_queue")
-      .update({
-        status: "pending",
-        started_at: null,
-        last_error: "Reset from stuck state by monitoring cron"
-      })
+      .select("id, job_type, attempts, max_attempts, started_at")
       .eq("status", "processing")
-      .lt("started_at", thirtyMinutesAgo)
-      .select("id");
+      .lt("started_at", oneHourAgo)
+      .limit(10); // Don't reset too many at once
 
-    if (stuckError) {
-      console.warn("[Monitoring] Stuck jobs reset error:", stuckError);
-    } else if (stuckJobs && stuckJobs.length > 0) {
-      console.log(`[Monitoring] Reset ${stuckJobs.length} stuck jobs`);
+    let stuckJobsReset = 0;
+    const stuckJobIds: string[] = [];
 
-      // Alert if we have stuck jobs
-      await supabase.rpc("create_alert", {
-        p_alert_type: "job_stuck",
-        p_severity: "warning",
-        p_title: `${stuckJobs.length} stuck jobs reset`,
-        p_message: "Jobs were stuck in processing state for > 30 minutes",
-        p_context: { job_ids: stuckJobs.map((j: { id: string }) => j.id) },
-      });
+    if (queryError) {
+      console.warn("[Monitoring] Stuck jobs query error:", queryError);
+    } else if (potentiallyStuckJobs && potentiallyStuckJobs.length > 0) {
+      // Reset jobs one by one with individual logging
+      for (const job of potentiallyStuckJobs) {
+        // If max attempts exceeded, mark as failed, otherwise retry
+        const newStatus = job.attempts >= job.max_attempts ? "failed" : "pending";
+
+        const { data: updatedJob, error: updateError } = await supabase
+          .from("job_queue")
+          .update({
+            status: newStatus,
+            started_at: null,
+            last_error: `Reset from stuck state (processing since ${job.started_at})`,
+          })
+          .eq("id", job.id)
+          .eq("status", "processing") // Only if still processing (optimistic lock)
+          .select("id");
+
+        if (!updateError && updatedJob && updatedJob.length > 0) {
+          stuckJobIds.push(job.id);
+          stuckJobsReset++;
+          console.log(`[Monitoring] Reset stuck job ${job.id} (${job.job_type}) -> ${newStatus}, attempts: ${job.attempts}/${job.max_attempts}`);
+
+          // Log each reset for audit trail
+          await supabase.from("system_logs").insert({
+            event_type: "warning",
+            message: `Stuck job reset: ${job.job_type}`,
+            details: {
+              job_id: job.id,
+              job_type: job.job_type,
+              attempts: job.attempts,
+              max_attempts: job.max_attempts,
+              started_at: job.started_at,
+              new_status: newStatus,
+            },
+          });
+        }
+      }
+
+      // Alert if we reset any stuck jobs
+      if (stuckJobIds.length > 0) {
+        await supabase.rpc("create_alert", {
+          p_alert_type: "job_stuck",
+          p_severity: "warning",
+          p_title: `${stuckJobIds.length} stuck jobs reset`,
+          p_message: "Jobs were stuck in processing state for > 60 minutes",
+          p_context: { job_ids: stuckJobIds },
+        });
+      }
     }
 
     // 7. CLEANUP OLD DATA
@@ -224,7 +263,7 @@ serve(async (req) => {
         success: true,
         monitoring: monitoringResult,
         security: securityResult,
-        stuck_jobs_reset: stuckJobs?.length || 0,
+        stuck_jobs_reset: stuckJobsReset,
         archived_clicks: archivedCount || 0,
         auto_complete: !autoCompleteError,
         auto_cancel: !autoCancelError,
