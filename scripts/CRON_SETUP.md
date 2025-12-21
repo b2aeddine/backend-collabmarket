@@ -10,8 +10,20 @@ The system uses several cron-triggered Edge Functions for background processing:
 |----------|---------|---------------------|
 | `job-worker` | Process background jobs from job_queue | Every minute |
 | `cron-process-withdrawals` | Process pending withdrawal payouts | Every 5 minutes |
-| `cron-monitoring` | Run health checks and monitoring | Every 15 minutes |
+| `cron-monitoring` | Health checks, auto-complete/cancel orders, stuck job recovery | Every 15 minutes |
 | `cleanup-orphan-orders` | Clean up stale orders | Daily at 3:00 AM |
+
+### cron-monitoring Features (V2.0)
+
+The `cron-monitoring` Edge Function now handles multiple tasks:
+
+1. **Health Monitoring** - Runs `run_monitoring_checks()` for system health
+2. **Security Audit** - Optional deep security scan (pass `X-Run-Security-Audit: true` header)
+3. **Auto-Complete Orders** - Completes delivered orders after 72h buyer inactivity
+4. **Auto-Cancel Orders** - Cancels unaccepted orders past `acceptance_deadline`
+5. **Stuck Job Recovery** - Resets jobs stuck in `processing` state > 30 minutes
+6. **Revenue Release** - Releases pending revenues when `available_at` is reached
+7. **Data Cleanup** - Archives old affiliate clicks, cleans expired data
 
 ## Authentication
 
