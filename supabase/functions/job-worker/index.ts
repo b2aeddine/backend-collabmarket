@@ -1,7 +1,8 @@
 // ==============================================================================
-// JOB-WORKER - V1.0 (SCHEMA V40 ALIGNED)
+// JOB-WORKER - V1.1 (SCHEMA V40 ALIGNED)
 // Background job processor for async tasks
 // SECURITY: Uses CRON_SECRET, atomic RPCs for job lifecycle
+// RELIABILITY: Timeout protection (50s default), full webhook processing
 // JOB TYPES: distribute_commissions, reverse_commissions, send_notification,
 //            sync_analytics, process_webhook, cleanup_data, release_revenues
 // ==============================================================================
@@ -491,10 +492,15 @@ async function handleReleaseRevenues(
 // MAIN HANDLER
 // ==============================================================================
 
+// Edge Function timeout safety margin (stop processing before we hit the 60s limit)
+const MAX_EXECUTION_TIME_MS = 50000; // 50 seconds
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return handleCorsOptions();
   }
+
+  const workerStartTime = Date.now();
 
   try {
     // SECURITY: Verify cron secret
@@ -514,6 +520,7 @@ serve(async (req) => {
     // Parse optional parameters
     let maxJobs = 10; // Default batch size
     let jobTypes: string[] | null = null;
+    let timeoutMs = MAX_EXECUTION_TIME_MS;
 
     try {
       const body = await req.json();
@@ -523,15 +530,26 @@ serve(async (req) => {
       if (body.job_types && Array.isArray(body.job_types)) {
         jobTypes = body.job_types;
       }
+      if (body.timeout_ms && typeof body.timeout_ms === "number") {
+        timeoutMs = Math.min(body.timeout_ms, MAX_EXECUTION_TIME_MS);
+      }
     } catch {
       // No body or invalid JSON, use defaults
     }
 
     const results: JobResult[] = [];
     let processedCount = 0;
+    let stoppedDueToTimeout = false;
 
-    // Process jobs in a loop
+    // Process jobs in a loop with timeout protection
     while (processedCount < maxJobs) {
+      // TIMEOUT CHECK: Stop processing if we're approaching the Edge Function timeout
+      const elapsedMs = Date.now() - workerStartTime;
+      if (elapsedMs > timeoutMs) {
+        console.log(`[Job Worker] Stopping due to timeout (${elapsedMs}ms elapsed, limit: ${timeoutMs}ms)`);
+        stoppedDueToTimeout = true;
+        break;
+      }
       // Claim next job using atomic RPC
       const { data: job, error: claimError } = await withDbRetry(() =>
         supabase.rpc("claim_next_job", {
@@ -630,16 +648,21 @@ serve(async (req) => {
     const totalDuration = results.reduce((sum, r) => sum + (r.duration || 0), 0);
 
     // Log processing cycle
+    // Calculate elapsed time
+    const totalElapsedMs = Date.now() - workerStartTime;
+
     if (results.length > 0) {
       await supabase.from("system_logs").insert({
         event_type: "job_worker",
-        message: "Job processing cycle completed",
+        message: stoppedDueToTimeout ? "Job processing stopped due to timeout" : "Job processing cycle completed",
         details: {
           processed: results.length,
           success: successCount,
           failed: failCount,
           total_duration_ms: totalDuration,
           avg_duration_ms: Math.round(totalDuration / results.length),
+          elapsed_ms: totalElapsedMs,
+          stopped_due_to_timeout: stoppedDueToTimeout,
         },
       });
     }
@@ -651,6 +674,8 @@ serve(async (req) => {
         successful: successCount,
         failed: failCount,
         total_duration_ms: totalDuration,
+        elapsed_ms: totalElapsedMs,
+        stopped_due_to_timeout: stoppedDueToTimeout,
         results,
       }),
       {
