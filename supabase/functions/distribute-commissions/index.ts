@@ -1,7 +1,8 @@
 // ==============================================================================
-// DISTRIBUTE-COMMISSIONS - V14.1 (SECURED)
+// DISTRIBUTE-COMMISSIONS - V14.2 (SECURED)
 // Distributes commissions for completed orders
 // SECURITY: Requires CRON_SECRET or INTERNAL_SECRET - NOT publicly callable!
+// VALIDATION: Verifies order status before distribution
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -40,6 +41,30 @@ serve(async (req) => {
         }
 
         console.log(`[Distribute Commissions] Processing order: ${order_id}`);
+
+        // SECURITY: Verify order exists and is in 'completed' status before distributing
+        const { data: order, error: orderError } = await supabase
+            .from("orders")
+            .select("id, status, order_number")
+            .eq("id", order_id)
+            .single();
+
+        if (orderError || !order) {
+            throw new Error(`Order not found: ${order_id}`);
+        }
+
+        if (order.status !== "completed") {
+            console.warn(`[Distribute Commissions] Order ${order_id} not completed (status: ${order.status})`);
+            return new Response(JSON.stringify({
+                success: false,
+                error: `Cannot distribute commissions: order status is '${order.status}', expected 'completed'`,
+                order_id,
+                current_status: order.status,
+            }), {
+                headers: { ...corsHeaders, "Content-Type": "application/json" },
+                status: 400,
+            });
+        }
 
         const { data, error } = await supabase.rpc("distribute_commissions", {
             p_order_id: order_id,

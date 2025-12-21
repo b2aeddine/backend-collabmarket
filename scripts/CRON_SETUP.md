@@ -21,7 +21,7 @@ The `cron-monitoring` Edge Function now handles multiple tasks:
 2. **Security Audit** - Optional deep security scan (pass `X-Run-Security-Audit: true` header)
 3. **Auto-Complete Orders** - Completes delivered orders after 72h buyer inactivity
 4. **Auto-Cancel Orders** - Cancels unaccepted orders past `acceptance_deadline`
-5. **Stuck Job Recovery** - Resets jobs stuck in `processing` state > 30 minutes
+5. **Stuck Job Recovery** - Resets jobs stuck in `processing` state > 60 minutes
 6. **Revenue Release** - Releases pending revenues when `available_at` is reached
 7. **Data Cleanup** - Archives old affiliate clicks, cleans expired data
 
