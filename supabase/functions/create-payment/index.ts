@@ -1,8 +1,10 @@
 // ==============================================================================
-// CREATE-PAYMENT - V15.1 (SCHEMA V40 ALIGNED)
+// CREATE-PAYMENT - V15.2 (SCHEMA V40 ALIGNED)
 // Crée une commande et initialise le PaymentIntent Stripe (mode escrow)
 // ALIGNED: Uses buyer_id/seller_id, services/service_packages, amounts_coherence
-// SECURITY: Verifies seller role, KYC status, and Stripe onboarding
+// SECURITY: Verifies seller role, KYC status, Stripe onboarding
+// SECURITY: Recalculates prices from DB (never trusts client amounts)
+// RELIABILITY: Uses Stripe idempotency keys, cleans up on failure
 // ==============================================================================
 
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
@@ -22,15 +24,12 @@ const paymentSchema = z.object({
   sellerId: z.string().uuid(),
   // Order details
   orderType: z.enum(['standard', 'custom', 'quote_request', 'offer']).default('standard'),
-  // Amounts (subtotal is the base price, discount is optional)
-  subtotal: z.number().min(1, "Minimum 1€"),
-  discountAmount: z.number().min(0).default(0),
-  // Optional affiliate link
+  // Optional affiliate link (discount source)
   affiliateLinkId: z.string().uuid().optional(),
   // Brief/requirements
   brief: z.string().max(5000).optional(),
   requirementsResponses: z.array(z.any()).optional(),
-  selectedExtras: z.array(z.any()).optional(),
+  selectedExtras: z.array(z.string().uuid()).optional(),
 });
 
 // Seller roles that can receive payments
@@ -62,19 +61,11 @@ serve(async (req) => {
       globalOfferId,
       sellerId,
       orderType,
-      subtotal,
-      discountAmount,
       affiliateLinkId,
       brief,
       requirementsResponses,
       selectedExtras,
     } = validation.data;
-
-    // Calculate total_amount per amounts_coherence constraint
-    const totalAmount = subtotal - discountAmount;
-    if (totalAmount < 1) {
-      return corsErrorResponse("Total amount must be at least 1€", 400);
-    }
 
     // Init Clients Supabase
     const supabaseUser = createClient(
@@ -149,9 +140,16 @@ serve(async (req) => {
       return corsErrorResponse("Seller has not completed Stripe onboarding", 400);
     }
 
+    // ===========================================================================
+    // PRICE CALCULATION FROM DB (NEVER TRUST CLIENT AMOUNTS)
+    // ===========================================================================
+    let subtotal = 0;
+    let discountAmount = 0;
+    let extrasTotal = 0;
+
     // Verify service/package if provided (for standard orders)
     if (orderType === 'standard' && serviceId) {
-      const { data: service, error: serviceError } = await supabaseUser
+      const { data: service, error: serviceError } = await supabaseAdmin
         .from("services")
         .select("id, seller_id, status, starting_price")
         .eq("id", serviceId)
@@ -168,13 +166,46 @@ serve(async (req) => {
       if (service.status !== 'active') {
         return corsErrorResponse("Service is not active", 400);
       }
+
+      // Use package price if specified, otherwise service starting price
+      if (packageId) {
+        const { data: pkg, error: pkgError } = await supabaseAdmin
+          .from("service_packages")
+          .select("id, service_id, price")
+          .eq("id", packageId)
+          .eq("service_id", serviceId)
+          .single();
+
+        if (pkgError || !pkg) {
+          return corsErrorResponse("Package not found or does not belong to this service", 404);
+        }
+
+        subtotal = pkg.price;
+      } else {
+        subtotal = service.starting_price || 0;
+      }
+
+      // Calculate extras if provided
+      if (selectedExtras && selectedExtras.length > 0) {
+        const { data: extras, error: extrasError } = await supabaseAdmin
+          .from("service_extras")
+          .select("id, price")
+          .eq("service_id", serviceId)
+          .in("id", selectedExtras);
+
+        if (!extrasError && extras) {
+          extrasTotal = extras.reduce((sum, e) => sum + (e.price || 0), 0);
+        }
+      }
+
+      subtotal += extrasTotal;
     }
 
     // Verify global offer if provided (for offer orders)
     if (orderType === 'offer' && globalOfferId) {
-      const { data: offer, error: offerError } = await supabaseUser
+      const { data: offer, error: offerError } = await supabaseAdmin
         .from("global_offers")
-        .select("id, author_id, status")
+        .select("id, author_id, status, budget")
         .eq("id", globalOfferId)
         .single();
 
@@ -186,14 +217,28 @@ serve(async (req) => {
       if (offer.author_id !== buyerId) {
         return corsErrorResponse("You are not the author of this offer", 403);
       }
+
+      subtotal = offer.budget || 0;
     }
 
-    // Verify affiliate link if provided
+    // Custom/quote orders - require a minimum
+    if (orderType === 'custom' || orderType === 'quote_request') {
+      // For custom orders, we need a quote_id or predefined price
+      // This should come from a quote acceptance flow
+      return corsErrorResponse("Custom orders require a pre-approved quote", 400);
+    }
+
+    // Validate subtotal
+    if (subtotal < 1) {
+      return corsErrorResponse("Price not found or invalid for this service/offer", 400);
+    }
+
+    // Verify affiliate link if provided and calculate discount from DB
     let validAffiliateLinkId: string | null = null;
     if (affiliateLinkId) {
       const { data: affiliateLink } = await supabaseAdmin
         .from("affiliate_links")
-        .select("id, agent_id, is_active")
+        .select("id, agent_id, is_active, discount_percent")
         .eq("id", affiliateLinkId)
         .single();
 
@@ -201,9 +246,21 @@ serve(async (req) => {
         // Anti-fraud: agent cannot be the buyer
         if (affiliateLink.agent_id !== buyerId) {
           validAffiliateLinkId = affiliateLinkId;
+          // Calculate discount from affiliate link percentage (from DB, not client)
+          if (affiliateLink.discount_percent && affiliateLink.discount_percent > 0) {
+            discountAmount = Math.round(subtotal * (affiliateLink.discount_percent / 100) * 100) / 100;
+          }
         }
       }
     }
+
+    // Calculate total_amount per amounts_coherence constraint
+    const totalAmount = subtotal - discountAmount;
+    if (totalAmount < 1) {
+      return corsErrorResponse("Total amount must be at least 1€ after discount", 400);
+    }
+
+    console.log(`[Create Payment] Prices calculated from DB: subtotal=${subtotal}, discount=${discountAmount}, total=${totalAmount}`);
 
     // Create the order in DB (amounts_coherence constraint will validate)
     const { data: order, error: insertError } = await supabaseAdmin
@@ -240,19 +297,45 @@ serve(async (req) => {
       httpClient: Stripe.createFetchHttpClient(),
     });
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(totalAmount * 100), // Stripe uses cents
-      currency: "eur",
-      automatic_payment_methods: { enabled: true },
-      capture_method: "manual", // ESCROW - capture when seller accepts
-      metadata: {
-        order_id: order.id,
-        order_number: order.order_number,
-        buyer_id: buyerId,
-        seller_id: sellerId,
-      },
-      transfer_group: order.id, // For reconciliation with transfers
-    });
+    let paymentIntent: Stripe.PaymentIntent;
+    try {
+      paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(totalAmount * 100), // Stripe uses cents
+        currency: "eur",
+        automatic_payment_methods: { enabled: true },
+        capture_method: "manual", // ESCROW - capture when seller accepts
+        metadata: {
+          order_id: order.id,
+          order_number: order.order_number,
+          buyer_id: buyerId,
+          seller_id: sellerId,
+        },
+        transfer_group: order.id, // For reconciliation with transfers
+      }, {
+        // IDEMPOTENCY: Use order ID to prevent duplicate payments
+        idempotencyKey: `create-payment-${order.id}`,
+      });
+    } catch (stripeError: unknown) {
+      const err = stripeError as Error;
+      console.error("[Create Payment] Stripe error, rolling back order:", err.message);
+
+      // CLEANUP: Delete the orphan order since Stripe failed
+      await supabaseAdmin.from("orders").delete().eq("id", order.id);
+
+      // Log the failure
+      await supabaseAdmin.from("system_logs").insert({
+        event_type: "error",
+        message: "Payment creation failed - order rolled back",
+        details: {
+          order_id: order.id,
+          buyer_id: buyerId,
+          seller_id: sellerId,
+          stripe_error: err.message,
+        },
+      });
+
+      return corsErrorResponse(`Stripe error: ${err.message}`, 500);
+    }
 
     // Update order with Stripe PaymentIntent ID
     const { error: updateError } = await supabaseAdmin

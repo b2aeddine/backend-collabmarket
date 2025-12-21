@@ -167,6 +167,7 @@ async function handleSyncAnalytics(
 
 /**
  * Process a webhook event (deferred processing)
+ * Handles Stripe webhook events that require order/payment state updates
  */
 async function handleProcessWebhook(
   supabase: SupabaseClient,
@@ -180,31 +181,245 @@ async function handleProcessWebhook(
     throw new Error("Missing event_id or event_type in payload");
   }
 
-  // Log the deferred processing
-  console.log(`[Job] Processing deferred webhook: ${eventType} (${eventId})`);
+  console.log(`[Job] Processing webhook: ${eventType} (${eventId})`);
 
-  // The actual processing logic depends on the event type
-  // This is a placeholder for custom webhook handling
+  // Extract the object from the event data
+  const stripeObject = eventData?.object as Record<string, unknown> | undefined;
+  if (!stripeObject) {
+    console.warn(`[Job] No object in webhook data for ${eventType}`);
+    return;
+  }
+
   switch (eventType) {
+    // =========================================================================
+    // PAYMENT INTENT EVENTS
+    // =========================================================================
+    case "payment_intent.amount_capturable_updated": {
+      // Payment authorized - update order status
+      const orderId = stripeObject.metadata?.order_id as string;
+      if (orderId) {
+        const { error } = await supabase
+          .from("orders")
+          .update({
+            status: "payment_authorized",
+            stripe_payment_status: "authorized",
+          })
+          .eq("id", orderId)
+          .eq("status", "pending");
+
+        if (error) {
+          console.warn(`[Job] Failed to update order ${orderId} to authorized:`, error.message);
+        } else {
+          console.log(`[Job] Order ${orderId} marked as payment_authorized`);
+        }
+      }
+      break;
+    }
+
+    case "payment_intent.succeeded": {
+      // Payment captured successfully
+      const orderId = stripeObject.metadata?.order_id as string;
+      if (orderId) {
+        const { error } = await supabase
+          .from("orders")
+          .update({
+            stripe_payment_status: "captured",
+          })
+          .eq("id", orderId);
+
+        if (!error) {
+          console.log(`[Job] Order ${orderId} payment captured`);
+        }
+      }
+      break;
+    }
+
+    case "payment_intent.payment_failed": {
+      const orderId = stripeObject.metadata?.order_id as string;
+      if (orderId) {
+        const { error } = await supabase
+          .from("orders")
+          .update({
+            stripe_payment_status: "failed",
+          })
+          .eq("id", orderId);
+
+        if (!error) {
+          console.log(`[Job] Order ${orderId} payment failed`);
+        }
+      }
+      break;
+    }
+
+    case "payment_intent.canceled": {
+      const orderId = stripeObject.metadata?.order_id as string;
+      if (orderId) {
+        // Payment cancelled - void the authorization
+        const { error } = await supabase
+          .from("orders")
+          .update({
+            status: "cancelled",
+            stripe_payment_status: "failed",
+            cancelled_at: new Date().toISOString(),
+          })
+          .eq("id", orderId)
+          .in("status", ["pending", "payment_authorized"]);
+
+        if (!error) {
+          console.log(`[Job] Order ${orderId} cancelled due to payment cancellation`);
+        }
+      }
+      break;
+    }
+
+    // =========================================================================
+    // REFUND EVENTS
+    // =========================================================================
+    case "charge.refunded": {
+      const paymentIntentId = stripeObject.payment_intent as string;
+      if (paymentIntentId) {
+        // Find order by payment intent and update status
+        const { data: order } = await supabase
+          .from("orders")
+          .select("id, status")
+          .eq("stripe_payment_intent_id", paymentIntentId)
+          .single();
+
+        if (order) {
+          // Reverse commissions if order was completed
+          if (order.status === "completed") {
+            await supabase.rpc("enqueue_job", {
+              p_job_type: "reverse_commissions",
+              p_payload: { order_id: order.id, reason: "Refund processed" },
+              p_priority: 10,
+            });
+          }
+
+          // Update order status
+          await supabase
+            .from("orders")
+            .update({
+              status: "refunded",
+              stripe_payment_status: "refunded",
+            })
+            .eq("id", order.id);
+
+          console.log(`[Job] Order ${order.id} marked as refunded, commissions reversal queued`);
+        }
+      }
+      break;
+    }
+
+    // =========================================================================
+    // DISPUTE EVENTS
+    // =========================================================================
+    case "charge.dispute.created": {
+      const paymentIntentId = stripeObject.payment_intent as string;
+      if (paymentIntentId) {
+        const { data: order } = await supabase
+          .from("orders")
+          .select("id")
+          .eq("stripe_payment_intent_id", paymentIntentId)
+          .single();
+
+        if (order) {
+          await supabase
+            .from("orders")
+            .update({ status: "disputed" })
+            .eq("id", order.id);
+
+          console.log(`[Job] Order ${order.id} marked as disputed`);
+
+          // Create alert for dispute
+          await supabase.rpc("create_alert", {
+            p_alert_type: "stripe_error",
+            p_severity: "critical",
+            p_title: "Payment dispute created",
+            p_message: `Dispute opened for order ${order.id}`,
+            p_context: { order_id: order.id, dispute_id: stripeObject.id },
+          });
+        }
+      }
+      break;
+    }
+
+    // =========================================================================
+    // PAYOUT EVENTS (Withdrawal completion)
+    // =========================================================================
+    case "payout.paid": {
+      const withdrawalId = stripeObject.metadata?.withdrawal_id as string;
+      if (withdrawalId) {
+        const { error } = await supabase.rpc("confirm_withdrawal_success", {
+          p_withdrawal_id: withdrawalId,
+          p_payout_id: stripeObject.id as string,
+        });
+
+        if (error) {
+          console.error(`[Job] Failed to confirm withdrawal ${withdrawalId}:`, error.message);
+          throw new Error(`confirm_withdrawal_success failed: ${error.message}`);
+        }
+
+        console.log(`[Job] Withdrawal ${withdrawalId} confirmed as paid`);
+      }
+      break;
+    }
+
+    case "payout.failed": {
+      const withdrawalId = stripeObject.metadata?.withdrawal_id as string;
+      if (withdrawalId) {
+        const failureMessage = (stripeObject.failure_message as string) || "Payout failed";
+
+        const { error } = await supabase.rpc("confirm_withdrawal_failure", {
+          p_withdrawal_id: withdrawalId,
+          p_reason: failureMessage,
+        });
+
+        if (!error) {
+          console.log(`[Job] Withdrawal ${withdrawalId} marked as failed: ${failureMessage}`);
+        }
+      }
+      break;
+    }
+
+    // =========================================================================
+    // CONNECT ACCOUNT EVENTS
+    // =========================================================================
+    case "account.updated": {
+      const accountId = stripeObject.id as string;
+      const chargesEnabled = stripeObject.charges_enabled as boolean;
+      const payoutsEnabled = stripeObject.payouts_enabled as boolean;
+
+      // Update user profile with onboarding status
+      const { error } = await supabase
+        .from("profiles")
+        .update({
+          stripe_onboarding_completed: chargesEnabled && payoutsEnabled,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("stripe_account_id", accountId);
+
+      if (!error) {
+        console.log(`[Job] Profile updated for Stripe account ${accountId}: charges=${chargesEnabled}, payouts=${payoutsEnabled}`);
+      }
+      break;
+    }
+
+    // =========================================================================
+    // INVOICE EVENTS
+    // =========================================================================
     case "invoice.payment_succeeded":
     case "invoice.payment_failed":
-      // Handle invoice events
       console.log(`[Job] Invoice event processed: ${eventType}`);
-      break;
-
-    case "account.updated":
-      // Handle Connect account updates
-      console.log(`[Job] Account update processed`);
       break;
 
     default:
       console.log(`[Job] Unhandled webhook type: ${eventType}`);
   }
 
-  // Mark as processed in system log
+  // Log processing completion
   await supabase.from("system_logs").insert({
     event_type: "webhook_processed",
-    message: `Deferred webhook processed: ${eventType}`,
+    message: `Webhook processed: ${eventType}`,
     details: { event_id: eventId, event_type: eventType },
   });
 }

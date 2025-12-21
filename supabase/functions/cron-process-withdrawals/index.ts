@@ -1,7 +1,8 @@
 // ==============================================================================
-// CRON-PROCESS-WITHDRAWALS - V15.0 (SCHEMA V40 ALIGNED)
+// CRON-PROCESS-WITHDRAWALS - V15.1 (SCHEMA V40 ALIGNED)
 // Processes pending withdrawals via Stripe Transfer + Payout
 // SECURITY: Uses CRON_SECRET, atomic RPCs for status transitions
+// RELIABILITY: Stripe idempotency keys, row-level locking via RPC
 // ALIGNED: Uses user_id, confirm_withdrawal_success/failure RPCs
 // ==============================================================================
 
@@ -125,19 +126,26 @@ serve(async (req) => {
       }
 
       try {
-        // Mark as processing (prevents double-processing)
-        const { error: processError } = await supabase
+        // ATOMIC LOCK: Mark as processing with row count verification
+        // Uses optimistic locking - only updates if status is still 'pending'
+        const { data: updateResult, error: processError } = await supabase
           .from("withdrawals")
-          .update({ status: "processing", updated_at: new Date().toISOString() })
+          .update({
+            status: "processing",
+            updated_at: new Date().toISOString(),
+          })
           .eq("id", withdrawal.id)
-          .eq("status", "pending"); // Only if still pending (optimistic lock)
+          .eq("status", "pending") // Only if still pending (optimistic lock)
+          .select("id");
 
-        if (processError) {
-          console.warn(`[Cron] Could not mark ${withdrawal.id} as processing:`, processError.message);
-          continue; // Skip, might be processed by another worker
+        // Verify we actually locked the row (not already claimed by another worker)
+        if (processError || !updateResult || updateResult.length === 0) {
+          console.warn(`[Cron] Withdrawal ${withdrawal.id} already claimed by another worker, skipping`);
+          continue;
         }
 
         // Step 1: Create Transfer from platform to connected account
+        // IDEMPOTENCY: Use withdrawal ID to prevent duplicate transfers
         const transfer = await stripe.transfers.create({
           amount: Math.round(withdrawal.amount * 100), // cents
           currency: "eur",
@@ -147,6 +155,8 @@ serve(async (req) => {
             user_id: withdrawal.user_id,
             type: "withdrawal_transfer",
           },
+        }, {
+          idempotencyKey: `transfer-${withdrawal.id}`,
         });
 
         // Update with transfer ID
@@ -158,6 +168,7 @@ serve(async (req) => {
         console.log(`[Cron] Transfer created: ${transfer.id} for withdrawal ${withdrawal.id}`);
 
         // Step 2: Create Payout from connected account to bank
+        // IDEMPOTENCY: Use withdrawal ID to prevent duplicate payouts
         const payout = await stripe.payouts.create(
           {
             amount: Math.round(withdrawal.amount * 100),
@@ -170,24 +181,21 @@ serve(async (req) => {
           },
           {
             stripeAccount: stripeAccountId,
+            idempotencyKey: `payout-${withdrawal.id}`,
           }
         );
 
         console.log(`[Cron] Payout created: ${payout.id} for withdrawal ${withdrawal.id}`);
 
-        // Step 3: Use atomic RPC to finalize
-        // Note: Payout status is async - Stripe will send webhook when completed
-        // For now, we mark as completed and trust the payout
-        // In production, you'd listen to payout.paid webhook instead
-        const { error: successError } = await supabase.rpc("confirm_withdrawal_success", {
-          p_withdrawal_id: withdrawal.id,
-          p_payout_id: payout.id,
-        });
-
-        if (successError) {
-          console.error(`[Cron] RPC confirm_withdrawal_success failed:`, successError.message);
-          // Don't throw - transfer/payout already created
-        }
+        // Step 3: Update with payout ID but DON'T mark as completed yet
+        // Wait for payout.paid webhook to confirm actual completion
+        await supabase
+          .from("withdrawals")
+          .update({
+            stripe_payout_id: payout.id,
+            // Keep status as 'processing' until webhook confirms
+          })
+          .eq("id", withdrawal.id);
 
         results.push({
           id: withdrawal.id,
@@ -196,7 +204,7 @@ serve(async (req) => {
           payoutId: payout.id,
         });
 
-        console.log(`[Cron] Successfully processed withdrawal ${withdrawal.id}`);
+        console.log(`[Cron] Withdrawal ${withdrawal.id} initiated - awaiting payout.paid webhook`);
 
       } catch (stripeError: unknown) {
         const err = stripeError as Error & { code?: string; type?: string };
