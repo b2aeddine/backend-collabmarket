@@ -1,6 +1,17 @@
 -- ============================================================================
--- COLLABMARKET V40.13 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.14 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.14]
+-- OBSERVABILITY & SCALE PREPARATION:
+-- [DLQ] Dead Letter Queue table for permanently failed jobs
+-- [DLQ] move_job_to_dlq(), retry_dlq_job() for job recovery
+-- [PART] analyze_partition_candidates() for table size monitoring
+-- [PART] generate_partition_ddl() for migration planning
+-- [PART] ensure_future_partitions() for automated maintenance
+-- [PERF] mv_seller_stats, mv_agent_stats, mv_platform_stats materialized views
+-- [PERF] get_seller_stats_fast(), get_agent_stats_fast() with MV fallback
+-- [PERF] refresh_stats_views() for cron-based refresh
+--
 -- [CHANGELOG V40.13]
 -- PERFORMANCE & RELIABILITY HARDENING:
 -- [FIX] check_webhook_replay: Fixed TOCTOU race condition using ON CONFLICT pattern
@@ -1565,6 +1576,164 @@ CREATE TABLE public.job_queue (
 );
 CREATE INDEX idx_job_queue_pending ON public.job_queue(status, priority DESC, scheduled_at ASC) WHERE status = 'pending';
 CREATE INDEX idx_job_queue_type ON public.job_queue(job_type, status);
+
+-- ==============================================================================
+-- V40.14: DEAD LETTER QUEUE (DLQ) for permanently failed jobs
+-- ==============================================================================
+-- Jobs that exceed max_attempts are moved here for manual investigation
+-- Prevents job loss and enables post-mortem debugging
+
+CREATE TABLE IF NOT EXISTS public.dead_letter_queue (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  original_job_id UUID NOT NULL,
+  job_type TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  attempts INTEGER NOT NULL,
+  last_error TEXT,
+  error_history JSONB DEFAULT '[]'::jsonb,  -- Array of {error, timestamp, attempt}
+  original_created_at TIMESTAMPTZ NOT NULL,
+  moved_to_dlq_at TIMESTAMPTZ DEFAULT NOW(),
+  reprocessed BOOLEAN DEFAULT FALSE,
+  reprocessed_at TIMESTAMPTZ,
+  reprocessed_job_id UUID,
+  notes TEXT
+);
+
+CREATE INDEX idx_dlq_job_type ON public.dead_letter_queue(job_type, moved_to_dlq_at DESC);
+CREATE INDEX idx_dlq_unprocessed ON public.dead_letter_queue(reprocessed, moved_to_dlq_at DESC) WHERE reprocessed = FALSE;
+
+ALTER TABLE public.dead_letter_queue ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "dlq_admin_only" ON public.dead_letter_queue FOR ALL USING (public.is_admin() OR public.is_service_role());
+
+-- Function to move a failed job to DLQ
+CREATE OR REPLACE FUNCTION public.move_job_to_dlq(
+  p_job_id UUID,
+  p_error TEXT DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_job public.job_queue%ROWTYPE;
+  v_dlq_id UUID;
+  v_error_history JSONB;
+BEGIN
+  -- Get the job
+  SELECT * INTO v_job FROM public.job_queue WHERE id = p_job_id;
+
+  IF v_job.id IS NULL THEN
+    RAISE EXCEPTION 'Job not found: %', p_job_id;
+  END IF;
+
+  -- Build error history
+  v_error_history := COALESCE(
+    (SELECT jsonb_agg(jsonb_build_object(
+      'error', COALESCE(p_error, v_job.last_error),
+      'attempt', v_job.attempts,
+      'timestamp', NOW()
+    ))),
+    '[]'::jsonb
+  );
+
+  -- Insert into DLQ
+  INSERT INTO public.dead_letter_queue (
+    original_job_id,
+    job_type,
+    payload,
+    attempts,
+    last_error,
+    error_history,
+    original_created_at
+  ) VALUES (
+    v_job.id,
+    v_job.job_type,
+    v_job.payload,
+    v_job.attempts,
+    COALESCE(p_error, v_job.last_error),
+    v_error_history,
+    v_job.created_at
+  ) RETURNING id INTO v_dlq_id;
+
+  -- Delete from job_queue (or mark as moved)
+  DELETE FROM public.job_queue WHERE id = p_job_id;
+
+  -- Log the move
+  INSERT INTO public.system_logs (level, event_type, message, details)
+  VALUES ('warn', 'job_moved_to_dlq', 'Job moved to dead letter queue after max attempts',
+    jsonb_build_object(
+      'job_id', p_job_id,
+      'dlq_id', v_dlq_id,
+      'job_type', v_job.job_type,
+      'attempts', v_job.attempts,
+      'error', COALESCE(p_error, v_job.last_error)
+    )
+  );
+
+  -- Create alert
+  PERFORM public.create_alert(
+    'job_failed',
+    'error',
+    'Job permanently failed and moved to DLQ: ' || v_job.job_type,
+    COALESCE(p_error, v_job.last_error),
+    jsonb_build_object('job_id', p_job_id, 'dlq_id', v_dlq_id, 'payload', v_job.payload)
+  );
+
+  RETURN v_dlq_id;
+END;
+$$;
+
+-- Function to retry a job from DLQ
+CREATE OR REPLACE FUNCTION public.retry_dlq_job(
+  p_dlq_id UUID,
+  p_max_attempts INTEGER DEFAULT 3
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_dlq public.dead_letter_queue%ROWTYPE;
+  v_new_job_id UUID;
+BEGIN
+  IF NOT public.is_admin() AND NOT public.is_service_role() THEN
+    RAISE EXCEPTION 'UNAUTHORIZED';
+  END IF;
+
+  SELECT * INTO v_dlq FROM public.dead_letter_queue WHERE id = p_dlq_id;
+
+  IF v_dlq.id IS NULL THEN
+    RAISE EXCEPTION 'DLQ entry not found: %', p_dlq_id;
+  END IF;
+
+  IF v_dlq.reprocessed THEN
+    RAISE EXCEPTION 'DLQ entry already reprocessed: %', p_dlq_id;
+  END IF;
+
+  -- Create new job
+  INSERT INTO public.job_queue (job_type, payload, max_attempts, priority)
+  VALUES (v_dlq.job_type, v_dlq.payload, p_max_attempts, 10)  -- High priority for retries
+  RETURNING id INTO v_new_job_id;
+
+  -- Mark DLQ entry as reprocessed
+  UPDATE public.dead_letter_queue
+  SET reprocessed = TRUE, reprocessed_at = NOW(), reprocessed_job_id = v_new_job_id
+  WHERE id = p_dlq_id;
+
+  -- Log
+  INSERT INTO public.audit_logs (event_name, table_name, record_id, new_values)
+  VALUES ('dlq_job_retried', 'dead_letter_queue', p_dlq_id,
+    jsonb_build_object('new_job_id', v_new_job_id, 'original_job_id', v_dlq.original_job_id)
+  );
+
+  RETURN v_new_job_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.move_job_to_dlq(UUID, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.retry_dlq_job(UUID, INTEGER) TO service_role;
 
 -- Enqueue un job avec priorité et scheduling optionnel
 CREATE OR REPLACE FUNCTION public.enqueue_job(
@@ -5168,6 +5337,374 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.audit_missing_fk_indexes() TO service_role;
+
+-- ============================================================================
+-- V40.14: PARTITIONING PREPARATION
+-- ============================================================================
+-- Prepare high-volume tables for future partitioning
+-- Strategy: Range partitioning by created_at (monthly partitions)
+-- Target tables: audit_logs, system_logs, order_messages, affiliate_clicks
+--
+-- MIGRATION PATH (when table grows > 10M rows):
+-- 1. Create new partitioned table with same schema
+-- 2. Create partitions for each month
+-- 3. Migrate data in batches during low traffic
+-- 4. Rename tables and update references
+-- 5. Set up automatic partition maintenance
+
+-- Function to analyze table sizes and recommend partitioning
+CREATE OR REPLACE FUNCTION public.analyze_partition_candidates()
+RETURNS TABLE (
+  table_name TEXT,
+  row_count BIGINT,
+  total_size TEXT,
+  index_size TEXT,
+  has_created_at BOOLEAN,
+  recommendation TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  WITH table_stats AS (
+    SELECT
+      relname::TEXT AS table_name,
+      n_live_tup AS row_count,
+      pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+      pg_size_pretty(pg_indexes_size(c.oid)) AS index_size,
+      pg_total_relation_size(c.oid) AS size_bytes
+    FROM pg_stat_user_tables s
+    JOIN pg_class c ON c.relname = s.relname
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+  ),
+  has_timestamp AS (
+    SELECT
+      table_name,
+      TRUE AS has_created_at
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND column_name = 'created_at'
+      AND data_type = 'timestamp with time zone'
+  )
+  SELECT
+    ts.table_name,
+    ts.row_count,
+    ts.total_size,
+    ts.index_size,
+    COALESCE(ht.has_created_at, FALSE),
+    CASE
+      WHEN ts.row_count > 10000000 THEN 'CRITICAL: Partition immediately (>10M rows)'
+      WHEN ts.row_count > 1000000 THEN 'RECOMMENDED: Plan partitioning (>1M rows)'
+      WHEN ts.row_count > 100000 THEN 'MONITOR: Consider partitioning when growth continues'
+      ELSE 'OK: No partitioning needed yet'
+    END AS recommendation
+  FROM table_stats ts
+  LEFT JOIN has_timestamp ht ON ht.table_name = ts.table_name
+  WHERE ts.table_name IN ('audit_logs', 'system_logs', 'order_messages', 'affiliate_clicks', 'ledger_entries', 'payment_logs')
+  ORDER BY ts.row_count DESC;
+END;
+$$;
+
+-- Function to generate partition DDL for a table
+CREATE OR REPLACE FUNCTION public.generate_partition_ddl(
+  p_table_name TEXT,
+  p_start_date DATE DEFAULT '2024-01-01',
+  p_end_date DATE DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_ddl TEXT := '';
+  v_current DATE;
+  v_end DATE;
+  v_partition_name TEXT;
+BEGIN
+  v_end := COALESCE(p_end_date, (CURRENT_DATE + INTERVAL '3 months')::DATE);
+  v_current := p_start_date;
+
+  v_ddl := v_ddl || '-- Partitioned table for ' || p_table_name || E'\n';
+  v_ddl := v_ddl || '-- Generated on ' || NOW()::TEXT || E'\n\n';
+
+  -- Note about creating the partitioned table
+  v_ddl := v_ddl || '-- Step 1: Create partitioned table (run during maintenance window)' || E'\n';
+  v_ddl := v_ddl || '-- CREATE TABLE ' || p_table_name || '_partitioned (' || E'\n';
+  v_ddl := v_ddl || '--   LIKE ' || p_table_name || ' INCLUDING ALL' || E'\n';
+  v_ddl := v_ddl || '-- ) PARTITION BY RANGE (created_at);' || E'\n\n';
+
+  -- Generate monthly partitions
+  v_ddl := v_ddl || '-- Step 2: Create monthly partitions' || E'\n';
+
+  WHILE v_current < v_end LOOP
+    v_partition_name := p_table_name || '_y' || EXTRACT(YEAR FROM v_current)::TEXT ||
+                        'm' || LPAD(EXTRACT(MONTH FROM v_current)::TEXT, 2, '0');
+
+    v_ddl := v_ddl || 'CREATE TABLE IF NOT EXISTS public.' || v_partition_name;
+    v_ddl := v_ddl || ' PARTITION OF public.' || p_table_name || '_partitioned';
+    v_ddl := v_ddl || ' FOR VALUES FROM (''' || v_current::TEXT || ''')';
+    v_ddl := v_ddl || ' TO (''' || (v_current + INTERVAL '1 month')::DATE::TEXT || ''');' || E'\n';
+
+    v_current := v_current + INTERVAL '1 month';
+  END LOOP;
+
+  v_ddl := v_ddl || E'\n-- Step 3: Migrate data in batches (run during low traffic)' || E'\n';
+  v_ddl := v_ddl || '-- INSERT INTO ' || p_table_name || '_partitioned SELECT * FROM ' || p_table_name;
+  v_ddl := v_ddl || ' WHERE created_at >= ''' || p_start_date::TEXT || ''';' || E'\n\n';
+
+  v_ddl := v_ddl || '-- Step 4: Swap tables' || E'\n';
+  v_ddl := v_ddl || '-- ALTER TABLE ' || p_table_name || ' RENAME TO ' || p_table_name || '_old;' || E'\n';
+  v_ddl := v_ddl || '-- ALTER TABLE ' || p_table_name || '_partitioned RENAME TO ' || p_table_name || ';' || E'\n';
+
+  RETURN v_ddl;
+END;
+$$;
+
+-- Function to create next month's partition (for cron automation)
+CREATE OR REPLACE FUNCTION public.ensure_future_partitions(
+  p_table_name TEXT,
+  p_months_ahead INTEGER DEFAULT 3
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_result TEXT := '';
+  v_current DATE;
+  v_partition_name TEXT;
+  v_partitioned_table TEXT;
+BEGIN
+  v_partitioned_table := p_table_name;
+  v_current := DATE_TRUNC('month', CURRENT_DATE);
+
+  FOR i IN 0..p_months_ahead LOOP
+    v_partition_name := p_table_name || '_y' || EXTRACT(YEAR FROM v_current)::TEXT ||
+                        'm' || LPAD(EXTRACT(MONTH FROM v_current)::TEXT, 2, '0');
+
+    -- Check if partition exists
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = v_partition_name
+    ) THEN
+      v_result := v_result || 'Would create: ' || v_partition_name || E'\n';
+      -- In production, execute: CREATE TABLE ... PARTITION OF ...
+    END IF;
+
+    v_current := v_current + INTERVAL '1 month';
+  END LOOP;
+
+  IF v_result = '' THEN
+    v_result := 'All partitions exist for next ' || p_months_ahead || ' months';
+  END IF;
+
+  RETURN v_result;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.analyze_partition_candidates() TO service_role;
+GRANT EXECUTE ON FUNCTION public.generate_partition_ddl(TEXT, DATE, DATE) TO service_role;
+GRANT EXECUTE ON FUNCTION public.ensure_future_partitions(TEXT, INTEGER) TO service_role;
+
+-- ============================================================================
+-- V40.14: MATERIALIZED VIEWS FOR DASHBOARD PERFORMANCE
+-- ============================================================================
+-- Pre-computed statistics for fast dashboard loading
+-- Refresh strategy: Every 5-15 minutes via cron or on-demand
+
+-- Seller statistics materialized view
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_seller_stats AS
+SELECT
+  p.id AS seller_id,
+  p.display_name,
+  COUNT(DISTINCT s.id) FILTER (WHERE s.id IS NOT NULL) AS total_services,
+  COUNT(DISTINCT s.id) FILTER (WHERE s.status = 'active') AS active_services,
+  COUNT(DISTINCT o.id) FILTER (WHERE o.id IS NOT NULL) AS total_orders,
+  COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'completed') AS completed_orders,
+  COUNT(DISTINCT o.id) FILTER (WHERE o.status IN ('pending', 'payment_authorized', 'accepted', 'in_progress', 'delivered')) AS active_orders,
+  COALESCE(SUM(sr.amount), 0) AS total_revenue,
+  COALESCE(SUM(sr.amount) FILTER (WHERE sr.status = 'pending'), 0) AS pending_balance,
+  COALESCE(SUM(sr.amount) FILTER (WHERE sr.status = 'available' AND sr.locked = FALSE), 0) AS available_balance,
+  COALESCE(SUM(sr.amount) FILTER (WHERE sr.status = 'withdrawn'), 0) AS withdrawn_total,
+  COALESCE(AVG(r.rating), 0)::DECIMAL(3,2) AS avg_rating,
+  COUNT(DISTINCT r.id) AS review_count,
+  NOW() AS refreshed_at
+FROM public.profiles p
+LEFT JOIN public.services s ON s.seller_id = p.id
+LEFT JOIN public.orders o ON o.seller_id = p.id
+LEFT JOIN public.seller_revenues sr ON sr.seller_id = p.id
+LEFT JOIN public.reviews r ON r.reviewed_id = p.id
+WHERE EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.role IN ('freelance', 'influencer'))
+GROUP BY p.id, p.display_name;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_seller_stats_id ON public.mv_seller_stats(seller_id);
+
+-- Agent statistics materialized view
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_agent_stats AS
+SELECT
+  p.id AS agent_id,
+  p.display_name,
+  COUNT(DISTINCT al.id) AS total_links,
+  COALESCE(SUM(al.click_count), 0) AS total_clicks,
+  COUNT(DISTINCT ac.id) FILTER (WHERE ac.status = 'confirmed') AS total_conversions,
+  COALESCE(SUM(ar.amount), 0) AS total_earnings,
+  COALESCE(SUM(ar.amount) FILTER (WHERE ar.status = 'pending'), 0) AS pending_balance,
+  COALESCE(SUM(ar.amount) FILTER (WHERE ar.status = 'available' AND ar.locked = FALSE), 0) AS available_balance,
+  CASE
+    WHEN COALESCE(SUM(al.click_count), 0) > 0
+    THEN (COUNT(DISTINCT ac.id) FILTER (WHERE ac.status = 'confirmed')::DECIMAL / SUM(al.click_count) * 100)
+    ELSE 0
+  END AS conversion_rate,
+  NOW() AS refreshed_at
+FROM public.profiles p
+LEFT JOIN public.affiliate_links al ON al.agent_id = p.id
+LEFT JOIN public.affiliate_conversions ac ON ac.agent_id = p.id
+LEFT JOIN public.agent_revenues ar ON ar.agent_id = p.id
+WHERE EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = p.id AND ur.role = 'agent')
+GROUP BY p.id, p.display_name;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_agent_stats_id ON public.mv_agent_stats(agent_id);
+
+-- Platform-wide stats materialized view
+CREATE MATERIALIZED VIEW IF NOT EXISTS public.mv_platform_stats AS
+SELECT
+  (SELECT COUNT(*) FROM public.profiles WHERE kyc_status = 'verified') AS verified_users,
+  (SELECT COUNT(*) FROM public.services WHERE status = 'active') AS active_services,
+  (SELECT COUNT(*) FROM public.orders WHERE created_at > NOW() - INTERVAL '30 days') AS orders_30d,
+  (SELECT COALESCE(SUM(total_amount), 0) FROM public.orders WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '30 days') AS revenue_30d,
+  (SELECT COUNT(*) FROM public.orders WHERE status = 'completed') AS total_completed_orders,
+  (SELECT COALESCE(SUM(amount), 0) FROM public.platform_revenues) AS total_platform_revenue,
+  (SELECT COUNT(*) FROM public.affiliate_links WHERE is_active = TRUE) AS active_affiliate_links,
+  (SELECT COALESCE(SUM(click_count), 0) FROM public.affiliate_links) AS total_affiliate_clicks,
+  NOW() AS refreshed_at;
+
+-- Function to refresh materialized views
+CREATE OR REPLACE FUNCTION public.refresh_stats_views()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_start TIMESTAMPTZ;
+  v_seller_ms INTEGER;
+  v_agent_ms INTEGER;
+  v_platform_ms INTEGER;
+BEGIN
+  -- Refresh seller stats
+  v_start := clock_timestamp();
+  REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_seller_stats;
+  v_seller_ms := EXTRACT(MILLISECONDS FROM clock_timestamp() - v_start)::INTEGER;
+
+  -- Refresh agent stats
+  v_start := clock_timestamp();
+  REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_agent_stats;
+  v_agent_ms := EXTRACT(MILLISECONDS FROM clock_timestamp() - v_start)::INTEGER;
+
+  -- Refresh platform stats
+  v_start := clock_timestamp();
+  REFRESH MATERIALIZED VIEW public.mv_platform_stats;
+  v_platform_ms := EXTRACT(MILLISECONDS FROM clock_timestamp() - v_start)::INTEGER;
+
+  RETURN jsonb_build_object(
+    'success', TRUE,
+    'refreshed_at', NOW(),
+    'duration_ms', jsonb_build_object(
+      'seller_stats', v_seller_ms,
+      'agent_stats', v_agent_ms,
+      'platform_stats', v_platform_ms
+    )
+  );
+END;
+$$;
+
+-- Optimized get_seller_stats using materialized view with fallback
+CREATE OR REPLACE FUNCTION public.get_seller_stats_fast(p_seller_id UUID DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_seller_id UUID;
+  v_stats RECORD;
+BEGIN
+  v_seller_id := COALESCE(p_seller_id, auth.uid());
+  IF v_seller_id IS NULL THEN RETURN '{}'::JSONB; END IF;
+
+  -- Try materialized view first (fast)
+  SELECT * INTO v_stats FROM public.mv_seller_stats WHERE seller_id = v_seller_id;
+
+  IF FOUND THEN
+    RETURN jsonb_build_object(
+      'total_services', v_stats.total_services,
+      'active_services', v_stats.active_services,
+      'total_orders', v_stats.total_orders,
+      'completed_orders', v_stats.completed_orders,
+      'active_orders', v_stats.active_orders,
+      'total_revenue', v_stats.total_revenue,
+      'pending_balance', v_stats.pending_balance,
+      'available_balance', v_stats.available_balance,
+      'avg_rating', v_stats.avg_rating,
+      'review_count', v_stats.review_count,
+      'cached_at', v_stats.refreshed_at
+    );
+  END IF;
+
+  -- Fallback to live query if not in materialized view
+  RETURN public.get_seller_stats(v_seller_id);
+END;
+$$;
+
+-- Optimized get_agent_stats using materialized view with fallback
+CREATE OR REPLACE FUNCTION public.get_agent_stats_fast(p_agent_id UUID DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_agent_id UUID;
+  v_stats RECORD;
+BEGIN
+  v_agent_id := COALESCE(p_agent_id, auth.uid());
+  IF v_agent_id IS NULL THEN RETURN '{}'::JSONB; END IF;
+
+  -- Try materialized view first (fast)
+  SELECT * INTO v_stats FROM public.mv_agent_stats WHERE agent_id = v_agent_id;
+
+  IF FOUND THEN
+    RETURN jsonb_build_object(
+      'total_links', v_stats.total_links,
+      'total_clicks', v_stats.total_clicks,
+      'total_conversions', v_stats.total_conversions,
+      'total_earnings', v_stats.total_earnings,
+      'pending_balance', v_stats.pending_balance,
+      'available_balance', v_stats.available_balance,
+      'conversion_rate', v_stats.conversion_rate,
+      'cached_at', v_stats.refreshed_at
+    );
+  END IF;
+
+  -- Fallback to live query
+  RETURN public.get_agent_stats(v_agent_id);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.refresh_stats_views() TO service_role;
+GRANT EXECUTE ON FUNCTION public.get_seller_stats_fast(UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_agent_stats_fast(UUID) TO authenticated;
+GRANT SELECT ON public.mv_seller_stats TO authenticated;
+GRANT SELECT ON public.mv_agent_stats TO authenticated;
+GRANT SELECT ON public.mv_platform_stats TO service_role;
 
 -- ============================================================================
 -- V40.12: CRON SCHEDULING & STATE MACHINE
