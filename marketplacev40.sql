@@ -1,6 +1,14 @@
 -- ============================================================================
--- COLLABMARKET V40.16 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.17 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.17]
+-- OPS & SECURITY HARDENING:
+-- [CRON] Made cron job scheduling idempotent (unschedule before schedule)
+-- [CRON] Added settings validation (app.settings.supabase_url, app.settings.cron_secret)
+-- [CRON] Added refresh-stats-views cron job (every 5 min)
+-- [AUDIT] New audit_exposed_security_definer() function to check SECURITY DEFINER exposure
+--         Flags functions granted to anon/authenticated with risk levels (HIGH/MEDIUM/LOW)
+--
 -- [CHANGELOG V40.16]
 -- HARDENING & COMPATIBILITY:
 -- [FIX] collabmarket_listings: Fixed column references (starting_price->base_price, seller_type->service_role)
@@ -4721,9 +4729,86 @@ BEGIN
 END;
 $$;
 
+-- V40.17: Audit SECURITY DEFINER functions exposed to anon/authenticated
+-- This helps identify functions that may need additional access controls
+CREATE OR REPLACE FUNCTION public.audit_exposed_security_definer()
+RETURNS TABLE (
+  function_name TEXT,
+  granted_to TEXT,
+  has_auth_check BOOLEAN,
+  risk_level TEXT,
+  recommendation TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  WITH definer_functions AS (
+    SELECT
+      p.oid,
+      p.proname::TEXT AS func_name,
+      pg_get_functiondef(p.oid) AS func_def
+    FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE n.nspname = 'public'
+      AND p.prosecdef = TRUE
+  ),
+  function_grants AS (
+    SELECT
+      df.func_name,
+      CASE
+        WHEN has_function_privilege('anon', df.oid, 'EXECUTE') THEN 'anon'
+        WHEN has_function_privilege('authenticated', df.oid, 'EXECUTE') THEN 'authenticated'
+        ELSE NULL
+      END AS grantee,
+      df.func_def
+    FROM definer_functions df
+    WHERE has_function_privilege('anon', df.oid, 'EXECUTE')
+       OR has_function_privilege('authenticated', df.oid, 'EXECUTE')
+  )
+  SELECT
+    fg.func_name,
+    fg.grantee,
+    -- Check if function contains auth checks
+    (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)|UNAUTHORIZED|auth\.role\(\)') AS has_auth_check,
+    -- Risk assessment
+    CASE
+      WHEN fg.grantee = 'anon' AND NOT (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)')
+        THEN 'HIGH'
+      WHEN fg.grantee = 'anon' AND (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)')
+        THEN 'MEDIUM'
+      WHEN fg.grantee = 'authenticated' AND NOT (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)')
+        THEN 'MEDIUM'
+      ELSE 'LOW'
+    END AS risk_level,
+    -- Recommendations
+    CASE
+      WHEN fg.grantee = 'anon' AND NOT (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)')
+        THEN 'REVIEW: anon access without auth checks - consider adding rate limiting or auth validation'
+      WHEN fg.grantee = 'anon'
+        THEN 'OK: anon access with auth checks present'
+      WHEN fg.grantee = 'authenticated' AND (fg.func_def ~* 'INSERT|UPDATE|DELETE') AND NOT (fg.func_def ~* 'auth\.uid\(\)')
+        THEN 'REVIEW: authenticated write without ownership check'
+      ELSE 'OK: authenticated access with controls'
+    END AS recommendation
+  FROM function_grants fg
+  ORDER BY
+    CASE
+      WHEN fg.grantee = 'anon' AND NOT (fg.func_def ~* 'auth\.uid\(\)|is_admin\(\)|is_service_role\(\)') THEN 1
+      WHEN fg.grantee = 'anon' THEN 2
+      WHEN fg.grantee = 'authenticated' AND NOT (fg.func_def ~* 'auth\.uid\(\)') THEN 3
+      ELSE 4
+    END,
+    fg.func_name;
+END;
+$$;
+
 GRANT EXECUTE ON FUNCTION public.audit_rls_coverage() TO service_role;
 GRANT EXECUTE ON FUNCTION public.audit_security_definer_functions() TO service_role;
 GRANT EXECUTE ON FUNCTION public.audit_permissive_policies() TO service_role;
+GRANT EXECUTE ON FUNCTION public.audit_exposed_security_definer() TO service_role;
 
 -- Table pour tracker les invariants comptables par transaction group
 CREATE TABLE IF NOT EXISTS public.ledger_balance_checks (
@@ -5849,75 +5934,119 @@ EXCEPTION
 END;
 $$;
 
+-- V40.17: Idempotent cron job scheduling with settings validation
 -- Schedule jobs if pg_cron is available
 DO $$
+DECLARE
+  v_supabase_url TEXT;
+  v_cron_secret TEXT;
+  v_jobs_requiring_http TEXT[] := ARRAY['job-worker', 'process-withdrawals', 'monitoring', 'cleanup-orphan-orders'];
+  v_job_name TEXT;
 BEGIN
-  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
-    -- Job Worker: Every minute
-    PERFORM cron.schedule('job-worker', '* * * * *',
-      $job$ SELECT net.http_post(
-        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/job-worker',
-        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
-        body := '{"max_jobs": 20}'::jsonb
-      ); $job$
-    );
-
-    -- Process Withdrawals: Every 5 minutes
-    PERFORM cron.schedule('process-withdrawals', '*/5 * * * *',
-      $job$ SELECT net.http_post(
-        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-process-withdrawals',
-        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
-        body := '{}'::jsonb
-      ); $job$
-    );
-
-    -- Monitoring: Every 15 minutes
-    PERFORM cron.schedule('monitoring', '*/15 * * * *',
-      $job$ SELECT net.http_post(
-        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-monitoring',
-        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
-        body := '{}'::jsonb
-      ); $job$
-    );
-
-    -- Cleanup Orphan Orders: Daily at 3:00 AM UTC
-    PERFORM cron.schedule('cleanup-orphan-orders', '0 3 * * *',
-      $job$ SELECT net.http_post(
-        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cleanup-orphan-orders',
-        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
-        body := '{}'::jsonb
-      ); $job$
-    );
-
-    -- Daily Analytics: 1:00 AM UTC
-    PERFORM cron.schedule('aggregate-analytics', '0 1 * * *',
-      $job$ SELECT public.aggregate_daily_stats(CURRENT_DATE - INTERVAL '1 day'); $job$
-    );
-
-    -- Auto-complete Orders: Every hour
-    PERFORM cron.schedule('auto-complete-orders', '0 * * * *',
-      $job$ SELECT public.auto_complete_orders(); $job$
-    );
-
-    -- Auto-cancel Expired: Every 30 minutes
-    PERFORM cron.schedule('auto-cancel-expired', '*/30 * * * *',
-      $job$ SELECT public.auto_cancel_expired_orders(); $job$
-    );
-
-    -- Cleanup Old Data: Weekly on Sunday 4:00 AM UTC
-    PERFORM cron.schedule('cleanup-old-data', '0 4 * * 0',
-      $job$ SELECT public.cleanup_old_data(); $job$
-    );
-
-    -- Release Pending Revenues: Hourly at :30
-    PERFORM cron.schedule('release-revenues', '30 * * * *',
-      $job$ SELECT public.release_pending_revenues(); $job$
-    );
-
-    RAISE NOTICE 'pg_cron jobs scheduled successfully';
-  ELSE
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
     RAISE NOTICE 'pg_cron not available. Use external cron services.';
+    RETURN;
   END IF;
+
+  -- Validate required settings for HTTP-based jobs
+  v_supabase_url := current_setting('app.settings.supabase_url', true);
+  v_cron_secret := current_setting('app.settings.cron_secret', true);
+
+  IF v_supabase_url IS NULL OR v_supabase_url = '' THEN
+    RAISE WARNING 'app.settings.supabase_url not configured - HTTP-based cron jobs will fail';
+    RAISE NOTICE 'Set via: ALTER DATABASE postgres SET app.settings.supabase_url = ''https://your-project.supabase.co'';';
+  END IF;
+
+  IF v_cron_secret IS NULL OR v_cron_secret = '' THEN
+    RAISE WARNING 'app.settings.cron_secret not configured - HTTP-based cron jobs will fail';
+    RAISE NOTICE 'Set via: ALTER DATABASE postgres SET app.settings.cron_secret = ''your-service-role-key'';';
+  END IF;
+
+  -- V40.17: Unschedule existing jobs first (idempotent)
+  -- This prevents duplicate jobs on re-runs
+  FOREACH v_job_name IN ARRAY ARRAY[
+    'job-worker', 'process-withdrawals', 'monitoring', 'cleanup-orphan-orders',
+    'aggregate-analytics', 'auto-complete-orders', 'auto-cancel-expired',
+    'cleanup-old-data', 'release-revenues', 'refresh-stats-views'
+  ]
+  LOOP
+    BEGIN
+      PERFORM cron.unschedule(v_job_name);
+    EXCEPTION WHEN OTHERS THEN
+      -- Job didn't exist, that's fine
+      NULL;
+    END;
+  END LOOP;
+
+  RAISE NOTICE 'Scheduling cron jobs...';
+
+  -- Job Worker: Every minute (HTTP)
+  PERFORM cron.schedule('job-worker', '* * * * *',
+    $job$ SELECT net.http_post(
+      url := current_setting('app.settings.supabase_url', true) || '/functions/v1/job-worker',
+      headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+      body := '{"max_jobs": 20}'::jsonb
+    ); $job$
+  );
+
+  -- Process Withdrawals: Every 5 minutes (HTTP)
+  PERFORM cron.schedule('process-withdrawals', '*/5 * * * *',
+    $job$ SELECT net.http_post(
+      url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-process-withdrawals',
+      headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+      body := '{}'::jsonb
+    ); $job$
+  );
+
+  -- Monitoring: Every 15 minutes (HTTP)
+  PERFORM cron.schedule('monitoring', '*/15 * * * *',
+    $job$ SELECT net.http_post(
+      url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-monitoring',
+      headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+      body := '{}'::jsonb
+    ); $job$
+  );
+
+  -- Cleanup Orphan Orders: Daily at 3:00 AM UTC (HTTP)
+  PERFORM cron.schedule('cleanup-orphan-orders', '0 3 * * *',
+    $job$ SELECT net.http_post(
+      url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cleanup-orphan-orders',
+      headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+      body := '{}'::jsonb
+    ); $job$
+  );
+
+  -- Daily Analytics: 1:00 AM UTC (DB function - no HTTP needed)
+  PERFORM cron.schedule('aggregate-analytics', '0 1 * * *',
+    $job$ SELECT public.aggregate_daily_stats(CURRENT_DATE - INTERVAL '1 day'); $job$
+  );
+
+  -- Auto-complete Orders: Every hour (DB function)
+  PERFORM cron.schedule('auto-complete-orders', '0 * * * *',
+    $job$ SELECT public.auto_complete_orders(); $job$
+  );
+
+  -- Auto-cancel Expired: Every 30 minutes (DB function)
+  PERFORM cron.schedule('auto-cancel-expired', '*/30 * * * *',
+    $job$ SELECT public.auto_cancel_expired_orders(); $job$
+  );
+
+  -- Cleanup Old Data: Weekly on Sunday 4:00 AM UTC (DB function)
+  PERFORM cron.schedule('cleanup-old-data', '0 4 * * 0',
+    $job$ SELECT public.cleanup_old_data(); $job$
+  );
+
+  -- Release Pending Revenues: Hourly at :30 (DB function)
+  PERFORM cron.schedule('release-revenues', '30 * * * *',
+    $job$ SELECT public.release_pending_revenues(); $job$
+  );
+
+  -- Refresh Stats Views: Every 5 minutes (DB function)
+  PERFORM cron.schedule('refresh-stats-views', '*/5 * * * *',
+    $job$ SELECT public.refresh_stats_views(); $job$
+  );
+
+  RAISE NOTICE 'pg_cron jobs scheduled successfully (10 jobs)';
 END;
 $$;
 
@@ -5989,7 +6118,7 @@ CREATE INDEX IF NOT EXISTS idx_job_queue_priority ON public.job_queue(priority D
 GRANT EXECUTE ON FUNCTION public.validate_order_transition() TO service_role;
 
 -- ============================================================================
--- V40.16: SMOKE TEST - Validation post-migration
+-- V40.17: SMOKE TEST - Validation post-migration
 -- ============================================================================
 -- This DO block validates critical objects exist after migration
 -- Run after migration completes to verify installation
@@ -6002,7 +6131,7 @@ DECLARE
   v_errors TEXT := '';
 BEGIN
   RAISE NOTICE '========================================';
-  RAISE NOTICE 'COLLABMARKET V40.16 - SMOKE TEST';
+  RAISE NOTICE 'COLLABMARKET V40.17 - SMOKE TEST';
   RAISE NOTICE '========================================';
 
   -- Check critical tables
@@ -6131,7 +6260,7 @@ BEGIN
   IF v_errors != '' THEN
     RAISE EXCEPTION 'SMOKE TEST FAILED:%', v_errors;
   ELSE
-    RAISE NOTICE 'SMOKE TEST PASSED - V40.16 ready for production';
+    RAISE NOTICE 'SMOKE TEST PASSED - V40.17 ready for production';
   END IF;
   RAISE NOTICE '========================================';
 END;
