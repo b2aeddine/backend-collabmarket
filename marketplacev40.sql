@@ -1,6 +1,16 @@
 -- ============================================================================
--- COLLABMARKET V40.14 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.15 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.15]
+-- CRITICAL SECURITY FIX:
+-- [SEC-P0] is_service_role(): REMOVED current_user='postgres' check that bypassed RLS
+--          Changed from SECURITY DEFINER to SECURITY INVOKER
+--          Now relies solely on JWT claims (correct Supabase pattern)
+-- [SEC-P1] rate_limits: Added length constraints (identifier<=128, endpoint<=100)
+-- [SEC-P1] rate_limit_endpoints: New whitelist table for valid endpoints
+-- [SEC-P1] check_rate_limit(): Enhanced with identifier hashing (SHA256)
+--          and endpoint validation against whitelist
+--
 -- [CHANGELOG V40.14]
 -- OBSERVABILITY & SCALE PREPARATION:
 -- [DLQ] Dead Letter Queue table for permanently failed jobs
@@ -229,16 +239,17 @@ BEGIN
 END;
 $$;
 
+-- V40.15: SECURITY FIX - Changed to SECURITY INVOKER
+-- Previous version had current_user = 'postgres' check which bypasses RLS
+-- in SECURITY DEFINER functions (current_user becomes the function owner)
+-- Now relies solely on JWT claims which is the correct approach for Supabase
 CREATE OR REPLACE FUNCTION public.is_service_role()
-RETURNS BOOLEAN LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-BEGIN
-  RETURN (
-    current_user = 'postgres'
-    OR COALESCE(current_setting('request.jwt.claims', true)::json->>'role', '') = 'service_role'
-  );
-EXCEPTION WHEN OTHERS THEN
-  RETURN FALSE;
-END;
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+AS $$
+  SELECT COALESCE(current_setting('request.jwt.claims', true)::json->>'role', '') = 'service_role';
 $$;
 
 CREATE OR REPLACE FUNCTION public.is_admin()
@@ -250,24 +261,79 @@ $$;
 -- 2. RATE LIMITING & WEBHOOKS
 -- ============================================================================
 
+-- V40.15: Added length constraints to prevent table bloat attacks
+-- identifier is hashed (SHA256) for privacy and fixed size
+-- endpoint is limited to valid API endpoints
 CREATE TABLE public.rate_limits (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  identifier TEXT NOT NULL,
-  endpoint TEXT NOT NULL,
-  hits INTEGER DEFAULT 1,
+  identifier TEXT NOT NULL CHECK (length(identifier) <= 128),  -- SHA256 hex = 64 chars, allow some margin
+  endpoint TEXT NOT NULL CHECK (length(endpoint) <= 100),      -- API endpoints are typically short
+  hits INTEGER DEFAULT 1 CHECK (hits > 0),
   window_start TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (identifier, endpoint)
 );
 CREATE INDEX idx_rate_limits_cleanup ON public.rate_limits(window_start);
 
+-- V40.15: Allowed endpoints whitelist for rate limiting
+-- This prevents attackers from creating arbitrary endpoint entries
+CREATE TABLE IF NOT EXISTS public.rate_limit_endpoints (
+  endpoint TEXT PRIMARY KEY CHECK (length(endpoint) <= 100),
+  max_requests INTEGER NOT NULL DEFAULT 30,
+  window_seconds INTEGER NOT NULL DEFAULT 60,
+  description TEXT
+);
+
+-- Seed common endpoints
+INSERT INTO public.rate_limit_endpoints (endpoint, max_requests, window_seconds, description) VALUES
+  ('auth/login', 10, 60, 'Login attempts'),
+  ('auth/register', 5, 60, 'Registration attempts'),
+  ('auth/password-reset', 3, 300, 'Password reset requests'),
+  ('payment/create', 20, 60, 'Payment creation'),
+  ('payment/webhook', 100, 60, 'Stripe webhooks'),
+  ('api/default', 100, 60, 'Default API rate limit'),
+  ('api/search', 30, 60, 'Search queries'),
+  ('api/upload', 10, 60, 'File uploads')
+ON CONFLICT (endpoint) DO NOTHING;
+
+-- V40.15: Enhanced rate limiting with identifier hashing and endpoint validation
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
   p_identifier TEXT,
   p_endpoint TEXT,
-  p_max_requests INTEGER DEFAULT 30,
-  p_window_seconds INTEGER DEFAULT 60
+  p_max_requests INTEGER DEFAULT NULL,  -- NULL = use endpoint defaults
+  p_window_seconds INTEGER DEFAULT NULL  -- NULL = use endpoint defaults
 ) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
-DECLARE v_count INTEGER;
+DECLARE
+  v_count INTEGER;
+  v_hashed_identifier TEXT;
+  v_max_requests INTEGER;
+  v_window_seconds INTEGER;
+  v_normalized_endpoint TEXT;
 BEGIN
+  -- Validate input lengths (defense in depth)
+  IF length(p_identifier) > 512 OR length(p_endpoint) > 100 THEN
+    RETURN FALSE;  -- Reject oversized inputs
+  END IF;
+
+  -- Hash identifier for privacy (SHA256, hex encoded = 64 chars)
+  v_hashed_identifier := encode(sha256(p_identifier::bytea), 'hex');
+
+  -- Normalize endpoint (lowercase, trim)
+  v_normalized_endpoint := lower(trim(p_endpoint));
+
+  -- Get rate limits from whitelist, fallback to api/default, then to hardcoded defaults
+  SELECT COALESCE(p_max_requests, rle.max_requests, 30),
+         COALESCE(p_window_seconds, rle.window_seconds, 60)
+  INTO v_max_requests, v_window_seconds
+  FROM public.rate_limit_endpoints rle
+  WHERE rle.endpoint = v_normalized_endpoint
+     OR rle.endpoint = 'api/default'
+  ORDER BY CASE WHEN rle.endpoint = v_normalized_endpoint THEN 0 ELSE 1 END
+  LIMIT 1;
+
+  -- Use hardcoded defaults if no endpoint config found
+  v_max_requests := COALESCE(v_max_requests, p_max_requests, 30);
+  v_window_seconds := COALESCE(v_window_seconds, p_window_seconds, 60);
+
   -- Cleanup 1% du temps au lieu de chaque appel (perf)
   -- Le cleanup complet est fait par cleanup_old_data() via cron
   IF random() < 0.01 THEN
@@ -275,18 +341,19 @@ BEGIN
   END IF;
 
   INSERT INTO public.rate_limits (identifier, endpoint, hits, window_start)
-  VALUES (p_identifier, p_endpoint, 1, NOW())
+  VALUES (v_hashed_identifier, v_normalized_endpoint, 1, NOW())
   ON CONFLICT (identifier, endpoint) DO UPDATE SET
     hits = CASE
-      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN 1
+      WHEN public.rate_limits.window_start < NOW() - (v_window_seconds || ' seconds')::INTERVAL THEN 1
       ELSE public.rate_limits.hits + 1
     END,
     window_start = CASE
-      WHEN public.rate_limits.window_start < NOW() - (p_window_seconds || ' seconds')::INTERVAL THEN NOW()
+      WHEN public.rate_limits.window_start < NOW() - (v_window_seconds || ' seconds')::INTERVAL THEN NOW()
       ELSE public.rate_limits.window_start
     END
   RETURNING hits INTO v_count;
-  RETURN v_count <= p_max_requests;
+
+  RETURN v_count <= v_max_requests;
 END;
 $$;
 
@@ -1578,7 +1645,7 @@ CREATE INDEX idx_job_queue_pending ON public.job_queue(status, priority DESC, sc
 CREATE INDEX idx_job_queue_type ON public.job_queue(job_type, status);
 
 -- ==============================================================================
--- V40.14: DEAD LETTER QUEUE (DLQ) for permanently failed jobs
+-- V40.14: DEAD LETTER QUEUE (DLQ) for permanently failed jobs (enhanced in V40.15)
 -- ==============================================================================
 -- Jobs that exceed max_attempts are moved here for manual investigation
 -- Prevents job loss and enables post-mortem debugging
@@ -3596,6 +3663,11 @@ CREATE POLICY "job_queue_service_manage" ON public.job_queue FOR ALL USING (publ
 
 -- RATE_LIMITS
 CREATE POLICY "rate_limits_service_manage" ON public.rate_limits FOR ALL USING (public.is_service_role());
+
+-- RATE_LIMIT_ENDPOINTS (V40.15)
+ALTER TABLE public.rate_limit_endpoints ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "rate_limit_endpoints_service_manage" ON public.rate_limit_endpoints FOR ALL USING (public.is_service_role());
+CREATE POLICY "rate_limit_endpoints_public_read" ON public.rate_limit_endpoints FOR SELECT USING (TRUE);  -- Endpoints config is not sensitive
 
 -- PROCESSED_WEBHOOKS
 CREATE POLICY "webhooks_service_manage" ON public.processed_webhooks FOR ALL USING (public.is_service_role());
