@@ -2719,6 +2719,15 @@ BEGIN
   DELETE FROM public.processed_webhooks WHERE processed_at < NOW() - INTERVAL '7 days';
   DELETE FROM public.rate_limits WHERE window_start < NOW() - INTERVAL '1 hour';
   DELETE FROM public.system_logs WHERE created_at < NOW() - INTERVAL '30 days' AND level IN ('debug', 'info');
+  -- V40.13: Archive old audit_logs (keep 1 year for compliance, then delete)
+  -- Note: For strict compliance requirements, consider moving to cold storage instead
+  DELETE FROM public.audit_logs WHERE created_at < NOW() - INTERVAL '365 days';
+  -- Clean old resolved system_alerts
+  DELETE FROM public.system_alerts WHERE resolved = TRUE AND resolved_at < NOW() - INTERVAL '90 days';
+  -- Clean old processed stripe_event_log entries
+  DELETE FROM public.stripe_event_log WHERE processed = TRUE AND processed_at < NOW() - INTERVAL '30 days';
+  -- Clean old ledger_balance_checks (keep 90 days for debugging)
+  DELETE FROM public.ledger_balance_checks WHERE checked_at < NOW() - INTERVAL '90 days';
 END;
 $$;
 
@@ -5041,8 +5050,134 @@ $$;
 GRANT EXECUTE ON FUNCTION public.archive_old_affiliate_clicks() TO service_role;
 
 -- ============================================================================
+-- V40.13: CONFIGURATION VALIDATION
+-- ============================================================================
+-- Validates that required app.settings are configured for pg_cron jobs
+
+CREATE OR REPLACE FUNCTION public.validate_cron_configuration()
+RETURNS TABLE (
+  setting_name TEXT,
+  current_value TEXT,
+  is_configured BOOLEAN,
+  issue TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    'app.settings.supabase_url'::TEXT,
+    current_setting('app.settings.supabase_url', true)::TEXT,
+    current_setting('app.settings.supabase_url', true) IS NOT NULL
+      AND current_setting('app.settings.supabase_url', true) != '',
+    CASE
+      WHEN current_setting('app.settings.supabase_url', true) IS NULL
+        OR current_setting('app.settings.supabase_url', true) = ''
+      THEN 'CRITICAL: supabase_url not set. Run: ALTER DATABASE postgres SET app.settings.supabase_url = ''https://YOUR_PROJECT.supabase.co'''
+      ELSE 'OK'
+    END;
+
+  RETURN QUERY
+  SELECT
+    'app.settings.cron_secret'::TEXT,
+    CASE
+      WHEN current_setting('app.settings.cron_secret', true) IS NOT NULL
+        AND current_setting('app.settings.cron_secret', true) != ''
+      THEN '***CONFIGURED***'
+      ELSE 'NOT SET'
+    END::TEXT,
+    current_setting('app.settings.cron_secret', true) IS NOT NULL
+      AND current_setting('app.settings.cron_secret', true) != '',
+    CASE
+      WHEN current_setting('app.settings.cron_secret', true) IS NULL
+        OR current_setting('app.settings.cron_secret', true) = ''
+      THEN 'CRITICAL: cron_secret not set. Run: ALTER DATABASE postgres SET app.settings.cron_secret = ''your-secret'''
+      ELSE 'OK'
+    END;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.validate_cron_configuration() TO service_role;
+
+-- ============================================================================
+-- V40.13: FK INDEX VALIDATION
+-- ============================================================================
+-- Identifies Foreign Keys without supporting indexes (performance issue)
+
+CREATE OR REPLACE FUNCTION public.audit_missing_fk_indexes()
+RETURNS TABLE (
+  table_name TEXT,
+  constraint_name TEXT,
+  fk_columns TEXT[],
+  has_index BOOLEAN,
+  recommendation TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  WITH fk_info AS (
+    SELECT
+      tc.table_name::TEXT,
+      tc.constraint_name::TEXT,
+      array_agg(kcu.column_name::TEXT ORDER BY kcu.ordinal_position) AS fk_columns
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = 'public'
+    GROUP BY tc.table_name, tc.constraint_name
+  ),
+  existing_indexes AS (
+    SELECT
+      t.relname::TEXT AS table_name,
+      array_agg(a.attname::TEXT ORDER BY array_position(i.indkey::INT[], a.attnum)) AS indexed_columns
+    FROM pg_index i
+    JOIN pg_class t ON t.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+    WHERE n.nspname = 'public'
+    GROUP BY t.relname, i.indexrelid
+  )
+  SELECT
+    fk.table_name,
+    fk.constraint_name,
+    fk.fk_columns,
+    EXISTS (
+      SELECT 1 FROM existing_indexes ei
+      WHERE ei.table_name = fk.table_name
+        AND fk.fk_columns <@ ei.indexed_columns  -- FK columns are subset of index columns
+    ) AS has_index,
+    CASE
+      WHEN EXISTS (
+        SELECT 1 FROM existing_indexes ei
+        WHERE ei.table_name = fk.table_name
+          AND fk.fk_columns <@ ei.indexed_columns
+      ) THEN 'OK - Index exists'
+      ELSE 'CREATE INDEX idx_' || fk.table_name || '_' || array_to_string(fk.fk_columns, '_')
+           || ' ON public.' || fk.table_name || '(' || array_to_string(fk.fk_columns, ', ') || ');'
+    END AS recommendation
+  FROM fk_info fk
+  ORDER BY has_index, fk.table_name;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.audit_missing_fk_indexes() TO service_role;
+
+-- ============================================================================
 -- V40.12: CRON SCHEDULING & STATE MACHINE
 -- ============================================================================
+-- SCALING NOTE: The pg_cron + Edge Function approach works well for moderate volume.
+-- For high-volume scenarios (>1000 jobs/minute), consider:
+-- 1. External worker process (Node.js/Go) polling job_queue directly
+-- 2. Redis-based queue (BullMQ, Celery) for sub-second latency
+-- 3. Multiple worker instances with FOR UPDATE SKIP LOCKED concurrency
+-- The current design supports horizontal scaling via the SKIP LOCKED pattern.
 
 -- Enable pg_cron if available
 DO $$
