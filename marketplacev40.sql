@@ -1,6 +1,33 @@
 -- ============================================================================
--- COLLABMARKET V40.10 - PRODUCTION READY MULTI-ROLE SAAS EDITION (ALIGNED)
+-- COLLABMARKET V40.13 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.13]
+-- PERFORMANCE & RELIABILITY HARDENING:
+-- [FIX] check_webhook_replay: Fixed TOCTOU race condition using ON CONFLICT pattern
+-- [IDX] Added missing FK indexes: service_faqs, service_requirements, service_extras
+-- [IDX] Added date indexes: affiliate_conversions(created_at), ledger_entries(created_at)
+-- [IDX] Added composite indexes: portfolio_items, contact_messages
+-- [IDX] Added GIN index on services.search_tags for array search
+--
+-- [CHANGELOG V40.12]
+-- CRON SCHEDULING & STATE MACHINE:
+-- [CRON] pg_cron extension setup with graceful fallback
+-- [CRON] Scheduled jobs: job-worker, withdrawals, monitoring, cleanup
+-- [TRIG] validate_order_transition: Enforces state machine at DB level
+-- [IDX] Added stripe_payment_intent, withdrawals status indexes
+--
+-- [CHANGELOG V40.11]
+-- SECURITY & OPS HARDENING:
+-- [AUDIT] audit_rls_coverage(), audit_security_definer_functions(), audit_permissive_policies()
+-- [LEDGER] verify_ledger_balance(), audit_unbalanced_ledger_entries() for accounting invariants
+-- [MONEY] round_money(), calculate_commission_amounts() for standardized rounding
+-- [ALERT] system_alerts table + create_alert() for monitoring infrastructure
+-- [MONITOR] monitor_stuck_jobs(), monitor_failed_jobs(), monitor_financial_drift()
+-- [OPS] replay_webhook(), reprocess_commission_distribution(), fix_failed_withdrawal()
+-- [STRIPE] stripe_event_log for out-of-order webhook handling
+-- [TABLE] ledger_balance_checks, system_alerts, go_live_checklist
+-- [TRIG] validate_withdrawal_allocation_revenue for polymorphic FK
+--
 -- [CHANGELOG V40.10]
 -- EDGE FUNCTIONS V15.0 ALIGNMENT:
 -- [RPC] record_affiliate_click: SECURITY DEFINER function for anonymous tracking
@@ -260,12 +287,31 @@ CREATE TABLE public.processed_webhooks (
 );
 CREATE INDEX idx_webhooks_cleanup ON public.processed_webhooks(processed_at);
 
-CREATE OR REPLACE FUNCTION public.check_webhook_replay(p_event_id TEXT, p_event_type TEXT, p_payload_hash TEXT DEFAULT NULL)
-RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+-- V40.13: Fixed TOCTOU race condition using ON CONFLICT pattern
+-- Old version had: IF EXISTS check -> INSERT (race between check and insert)
+-- New version: atomic INSERT ON CONFLICT DO NOTHING RETURNING
+CREATE OR REPLACE FUNCTION public.check_webhook_replay(
+  p_event_id TEXT,
+  p_event_type TEXT,
+  p_payload_hash TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_inserted_id TEXT;
 BEGIN
-  IF EXISTS (SELECT 1 FROM public.processed_webhooks WHERE event_id = p_event_id) THEN RETURN FALSE; END IF;
-  INSERT INTO public.processed_webhooks (event_id, event_type, payload_hash) VALUES (p_event_id, p_event_type, p_payload_hash);
-  RETURN TRUE;
+  -- Atomic insert-if-not-exists using ON CONFLICT
+  -- Returns the event_id if inserted (first time), NULL if already exists
+  INSERT INTO public.processed_webhooks (event_id, event_type, payload_hash)
+  VALUES (p_event_id, p_event_type, p_payload_hash)
+  ON CONFLICT (event_id) DO NOTHING
+  RETURNING event_id INTO v_inserted_id;
+
+  -- If we got a value back, this is the first processing (not a replay)
+  RETURN v_inserted_id IS NOT NULL;
 END;
 $$;
 
@@ -660,6 +706,8 @@ CREATE INDEX idx_services_status ON public.services(status);
 CREATE INDEX idx_services_role ON public.services(service_role);
 CREATE INDEX idx_services_active ON public.services(status, is_affiliable) WHERE status = 'active';
 CREATE INDEX idx_services_search ON public.services USING GIN (to_tsvector('french', title || ' ' || description));
+-- V40.13: GIN index for search_tags array search (WHERE 'tag' = ANY(search_tags))
+CREATE INDEX idx_services_search_tags ON public.services USING GIN (search_tags);
 -- Slug unique par vendeur (permet à différents vendeurs d'avoir le même slug)
 CREATE UNIQUE INDEX idx_services_seller_slug ON public.services(seller_id, slug);
 
@@ -699,6 +747,8 @@ CREATE TABLE public.service_faqs (
   sort_order INTEGER DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- V40.13: Missing FK index for JOIN performance
+CREATE INDEX idx_service_faqs_service ON public.service_faqs(service_id);
 
 CREATE TABLE public.service_requirements (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -710,6 +760,8 @@ CREATE TABLE public.service_requirements (
   sort_order INTEGER DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- V40.13: Missing FK index for JOIN performance
+CREATE INDEX idx_service_requirements_service ON public.service_requirements(service_id);
 
 CREATE TABLE public.service_extras (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -721,6 +773,8 @@ CREATE TABLE public.service_extras (
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- V40.13: Missing FK index for JOIN performance
+CREATE INDEX idx_service_extras_service ON public.service_extras(service_id);
 
 CREATE TABLE public.service_tags (
   service_id UUID NOT NULL REFERENCES public.services(id) ON DELETE CASCADE,
@@ -813,6 +867,8 @@ CREATE TABLE public.portfolio_items (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX idx_portfolio_user ON public.portfolio_items(user_id);
+-- V40.13: Composite index for active + featured queries
+CREATE INDEX idx_portfolio_active_featured ON public.portfolio_items(user_id, is_active, is_featured DESC) WHERE is_active = TRUE;
 
 -- ============================================================================
 -- 9. AFFILIATION
@@ -890,6 +946,8 @@ CREATE TABLE public.affiliate_conversions (
 );
 CREATE INDEX idx_conversions_agent ON public.affiliate_conversions(agent_id);
 CREATE INDEX idx_conversions_order ON public.affiliate_conversions(order_id);
+-- V40.13: Date index for time-range analytics queries
+CREATE INDEX idx_conversions_created ON public.affiliate_conversions(created_at DESC);
 
 -- ============================================================================
 -- 10. ORDERS (COMMANDES)
@@ -1086,6 +1144,8 @@ CREATE TABLE public.ledger_entries (
 CREATE INDEX idx_ledger_group ON public.ledger_entries(transaction_group_id);
 CREATE INDEX idx_ledger_order ON public.ledger_entries(order_id);
 CREATE INDEX idx_ledger_account ON public.ledger_entries(account_type, account_id);
+-- V40.13: Date index for time-range analytics queries
+CREATE INDEX idx_ledger_entries_created ON public.ledger_entries(created_at DESC);
 
 -- Immutabilité du ledger
 CREATE OR REPLACE FUNCTION public.prevent_ledger_modification()
@@ -1483,6 +1543,8 @@ CREATE TABLE public.contact_messages (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- V40.13: Composite index for admin dashboard (filter by status, order by created_at)
+CREATE INDEX idx_contact_messages_status_created ON public.contact_messages(status, created_at DESC);
 
 CREATE TABLE public.job_queue (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4224,5 +4286,915 @@ $$;
 GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO anon;
 GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.record_affiliate_click(UUID, TEXT, TEXT, TEXT) TO service_role;
+
+-- ============================================================================
+-- V40.11: SECURITY & OPS HARDENING
+-- ============================================================================
+
+-- Fonction pour auditer les tables sans RLS
+CREATE OR REPLACE FUNCTION public.audit_rls_coverage()
+RETURNS TABLE (
+  table_name TEXT,
+  has_rls BOOLEAN,
+  policy_count INTEGER,
+  issue TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    t.tablename::TEXT,
+    t.rowsecurity AS has_rls,
+    COALESCE(p.policy_count, 0)::INTEGER,
+    CASE
+      WHEN NOT t.rowsecurity THEN 'CRITICAL: RLS not enabled'
+      WHEN COALESCE(p.policy_count, 0) = 0 THEN 'WARNING: RLS enabled but no policies'
+      ELSE 'OK'
+    END AS issue
+  FROM pg_tables t
+  LEFT JOIN (
+    SELECT schemaname, tablename, COUNT(*) AS policy_count
+    FROM pg_policies
+    GROUP BY schemaname, tablename
+  ) p ON t.schemaname = p.schemaname AND t.tablename = p.tablename
+  WHERE t.schemaname = 'public'
+    AND t.tablename NOT LIKE 'pg_%'
+    AND t.tablename NOT LIKE '_prisma%'
+  ORDER BY
+    CASE
+      WHEN NOT t.rowsecurity THEN 1
+      WHEN COALESCE(p.policy_count, 0) = 0 THEN 2
+      ELSE 3
+    END,
+    t.tablename;
+END;
+$$;
+
+-- Fonction pour auditer les fonctions SECURITY DEFINER
+CREATE OR REPLACE FUNCTION public.audit_security_definer_functions()
+RETURNS TABLE (
+  function_name TEXT,
+  has_search_path BOOLEAN,
+  search_path_value TEXT,
+  is_safe BOOLEAN,
+  issue TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    p.proname::TEXT AS function_name,
+    (p.proconfig IS NOT NULL AND array_to_string(p.proconfig, ',') LIKE '%search_path%') AS has_search_path,
+    COALESCE(
+      (SELECT regexp_replace(cfg, 'search_path=', '')
+       FROM unnest(p.proconfig) cfg
+       WHERE cfg LIKE 'search_path=%' LIMIT 1),
+      'NOT SET'
+    )::TEXT AS search_path_value,
+    (p.proconfig IS NOT NULL
+     AND array_to_string(p.proconfig, ',') LIKE '%search_path%'
+     AND array_to_string(p.proconfig, ',') LIKE '%pg_temp%') AS is_safe,
+    CASE
+      WHEN p.proconfig IS NULL OR NOT array_to_string(p.proconfig, ',') LIKE '%search_path%'
+        THEN 'CRITICAL: No search_path set - vulnerable to temp schema injection'
+      WHEN NOT array_to_string(p.proconfig, ',') LIKE '%pg_temp%'
+        THEN 'WARNING: search_path missing pg_temp'
+      ELSE 'OK'
+    END AS issue
+  FROM pg_proc p
+  JOIN pg_namespace n ON p.pronamespace = n.oid
+  WHERE n.nspname = 'public'
+    AND p.prosecdef = TRUE
+  ORDER BY
+    CASE
+      WHEN p.proconfig IS NULL OR NOT array_to_string(p.proconfig, ',') LIKE '%search_path%' THEN 1
+      WHEN NOT array_to_string(p.proconfig, ',') LIKE '%pg_temp%' THEN 2
+      ELSE 3
+    END,
+    p.proname;
+END;
+$$;
+
+-- Fonction pour vérifier les policies trop permissives
+CREATE OR REPLACE FUNCTION public.audit_permissive_policies()
+RETURNS TABLE (
+  table_name TEXT,
+  policy_name TEXT,
+  policy_type TEXT,
+  roles TEXT[],
+  using_expr TEXT,
+  check_expr TEXT,
+  issue TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    pol.tablename::TEXT,
+    pol.policyname::TEXT,
+    pol.cmd::TEXT AS policy_type,
+    pol.roles::TEXT[],
+    pol.qual::TEXT AS using_expr,
+    pol.with_check::TEXT AS check_expr,
+    CASE
+      WHEN pol.qual = 'true' OR pol.qual IS NULL THEN 'CRITICAL: USING clause allows all rows'
+      WHEN pol.with_check = 'true' THEN 'WARNING: WITH CHECK allows all mutations'
+      WHEN 'public' = ANY(pol.roles) THEN 'WARNING: Policy applies to PUBLIC role'
+      ELSE 'OK'
+    END AS issue
+  FROM pg_policies pol
+  WHERE pol.schemaname = 'public'
+    AND (pol.qual = 'true' OR pol.qual IS NULL OR pol.with_check = 'true' OR 'public' = ANY(pol.roles))
+  ORDER BY
+    CASE
+      WHEN pol.qual = 'true' OR pol.qual IS NULL THEN 1
+      WHEN pol.with_check = 'true' THEN 2
+      ELSE 3
+    END,
+    pol.tablename;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.audit_rls_coverage() TO service_role;
+GRANT EXECUTE ON FUNCTION public.audit_security_definer_functions() TO service_role;
+GRANT EXECUTE ON FUNCTION public.audit_permissive_policies() TO service_role;
+
+-- Table pour tracker les invariants comptables par transaction group
+CREATE TABLE IF NOT EXISTS public.ledger_balance_checks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  transaction_group_id UUID NOT NULL,
+  total_debits DECIMAL(12,2) NOT NULL,
+  total_credits DECIMAL(12,2) NOT NULL,
+  is_balanced BOOLEAN NOT NULL,
+  variance DECIMAL(12,2),
+  checked_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_ledger_balance_checks_group ON public.ledger_balance_checks(transaction_group_id);
+CREATE INDEX idx_ledger_balance_checks_unbalanced ON public.ledger_balance_checks(is_balanced) WHERE is_balanced = FALSE;
+
+ALTER TABLE public.ledger_balance_checks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "ledger_balance_checks_admin" ON public.ledger_balance_checks FOR ALL USING (public.is_admin() OR public.is_service_role());
+
+-- Fonction pour vérifier l'équilibre d'un transaction group
+CREATE OR REPLACE FUNCTION public.verify_ledger_balance(p_transaction_group_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_debits DECIMAL(12,2);
+  v_credits DECIMAL(12,2);
+  v_is_balanced BOOLEAN;
+BEGIN
+  SELECT
+    COALESCE(SUM(CASE WHEN entry_type = 'debit' THEN amount ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN entry_type = 'credit' THEN amount ELSE 0 END), 0)
+  INTO v_debits, v_credits
+  FROM public.ledger_entries
+  WHERE transaction_group_id = p_transaction_group_id;
+
+  v_is_balanced := ABS(v_debits - v_credits) < 0.01;
+
+  INSERT INTO public.ledger_balance_checks (transaction_group_id, total_debits, total_credits, is_balanced, variance)
+  VALUES (p_transaction_group_id, v_debits, v_credits, v_is_balanced, v_debits - v_credits);
+
+  RETURN v_is_balanced;
+END;
+$$;
+
+-- Fonction pour auditer tous les transaction groups non équilibrés
+CREATE OR REPLACE FUNCTION public.audit_unbalanced_ledger_entries()
+RETURNS TABLE (
+  transaction_group_id UUID,
+  total_debits DECIMAL,
+  total_credits DECIMAL,
+  variance DECIMAL,
+  entry_count INTEGER,
+  order_ids UUID[]
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    le.transaction_group_id,
+    SUM(CASE WHEN le.entry_type = 'debit' THEN le.amount ELSE 0 END) AS total_debits,
+    SUM(CASE WHEN le.entry_type = 'credit' THEN le.amount ELSE 0 END) AS total_credits,
+    SUM(CASE WHEN le.entry_type = 'debit' THEN le.amount ELSE 0 END) -
+    SUM(CASE WHEN le.entry_type = 'credit' THEN le.amount ELSE 0 END) AS variance,
+    COUNT(*)::INTEGER AS entry_count,
+    ARRAY_AGG(DISTINCT le.order_id) FILTER (WHERE le.order_id IS NOT NULL) AS order_ids
+  FROM public.ledger_entries le
+  GROUP BY le.transaction_group_id
+  HAVING ABS(SUM(CASE WHEN le.entry_type = 'debit' THEN le.amount ELSE 0 END) -
+             SUM(CASE WHEN le.entry_type = 'credit' THEN le.amount ELSE 0 END)) >= 0.01
+  ORDER BY variance DESC;
+END;
+$$;
+
+-- Fonction d'arrondi standardisée (HALF_UP, 2 décimales)
+CREATE OR REPLACE FUNCTION public.round_money(p_amount DECIMAL)
+RETURNS DECIMAL
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT ROUND(p_amount, 2);
+$$;
+
+-- Fonction de calcul commission avec arrondis explicites
+CREATE OR REPLACE FUNCTION public.calculate_commission_amounts(
+  p_total_amount DECIMAL,
+  p_platform_fee_rate DECIMAL,
+  p_agent_commission_rate DECIMAL,
+  p_platform_cut_on_agent_rate DECIMAL
+)
+RETURNS TABLE (
+  platform_fee DECIMAL,
+  agent_gross DECIMAL,
+  platform_from_agent DECIMAL,
+  agent_net DECIMAL,
+  seller_amount DECIMAL,
+  total_platform DECIMAL,
+  check_sum DECIMAL
+)
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  v_platform_fee DECIMAL;
+  v_agent_gross DECIMAL;
+  v_platform_from_agent DECIMAL;
+  v_agent_net DECIMAL;
+  v_seller_amount DECIMAL;
+  v_total_platform DECIMAL;
+BEGIN
+  v_platform_fee := public.round_money(p_total_amount * p_platform_fee_rate / 100);
+  v_agent_gross := public.round_money(p_total_amount * p_agent_commission_rate / 100);
+  v_platform_from_agent := public.round_money(v_agent_gross * p_platform_cut_on_agent_rate / 100);
+  v_agent_net := public.round_money(v_agent_gross - v_platform_from_agent);
+  v_seller_amount := public.round_money(p_total_amount - v_agent_gross - v_platform_fee);
+  v_total_platform := public.round_money(v_platform_fee + v_platform_from_agent);
+
+  IF v_seller_amount + v_agent_net + v_total_platform != p_total_amount THEN
+    v_seller_amount := p_total_amount - v_agent_net - v_total_platform;
+  END IF;
+
+  RETURN QUERY SELECT
+    v_platform_fee,
+    v_agent_gross,
+    v_platform_from_agent,
+    v_agent_net,
+    v_seller_amount,
+    v_total_platform,
+    v_seller_amount + v_agent_net + v_total_platform AS check_sum;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.verify_ledger_balance(UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.audit_unbalanced_ledger_entries() TO service_role;
+GRANT EXECUTE ON FUNCTION public.round_money(DECIMAL) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.calculate_commission_amounts(DECIMAL, DECIMAL, DECIMAL, DECIMAL) TO service_role;
+
+-- Table pour les alertes système
+CREATE TABLE IF NOT EXISTS public.system_alerts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  alert_type TEXT NOT NULL CHECK (alert_type IN (
+    'webhook_failure', 'job_failed', 'job_stuck', 'balance_mismatch',
+    'transfer_failed', 'commission_drift', 'rls_violation', 'rate_limit_exceeded',
+    'withdrawal_failed', 'stripe_error', 'security_audit'
+  )),
+  severity TEXT NOT NULL DEFAULT 'warning' CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+  title TEXT NOT NULL,
+  message TEXT,
+  context JSONB DEFAULT '{}'::jsonb,
+  acknowledged BOOLEAN DEFAULT FALSE,
+  acknowledged_by UUID REFERENCES public.profiles(id),
+  acknowledged_at TIMESTAMPTZ,
+  resolved BOOLEAN DEFAULT FALSE,
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_system_alerts_unresolved ON public.system_alerts(severity, created_at DESC) WHERE resolved = FALSE;
+CREATE INDEX idx_system_alerts_type ON public.system_alerts(alert_type, created_at DESC);
+
+ALTER TABLE public.system_alerts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "alerts_admin_manage" ON public.system_alerts FOR ALL USING (public.is_admin() OR public.is_service_role());
+
+-- Fonction pour créer une alerte
+CREATE OR REPLACE FUNCTION public.create_alert(
+  p_alert_type TEXT,
+  p_severity TEXT,
+  p_title TEXT,
+  p_message TEXT DEFAULT NULL,
+  p_context JSONB DEFAULT '{}'::jsonb
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_alert_id UUID;
+BEGIN
+  INSERT INTO public.system_alerts (alert_type, severity, title, message, context)
+  VALUES (p_alert_type, p_severity, p_title, p_message, p_context)
+  RETURNING id INTO v_alert_id;
+
+  INSERT INTO public.system_logs (level, event_type, message, details)
+  VALUES (
+    CASE p_severity WHEN 'critical' THEN 'fatal' WHEN 'error' THEN 'error' ELSE 'warn' END,
+    'alert_created',
+    p_title,
+    jsonb_build_object('alert_id', v_alert_id, 'type', p_alert_type, 'context', p_context)
+  );
+
+  RETURN v_alert_id;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.create_alert(TEXT, TEXT, TEXT, TEXT, JSONB) TO service_role;
+
+-- Fonction de monitoring: jobs bloqués
+CREATE OR REPLACE FUNCTION public.monitor_stuck_jobs()
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_stuck_count INTEGER;
+  v_job RECORD;
+BEGIN
+  SELECT COUNT(*) INTO v_stuck_count
+  FROM public.job_queue
+  WHERE status = 'processing'
+    AND started_at < NOW() - INTERVAL '30 minutes';
+
+  IF v_stuck_count > 0 THEN
+    FOR v_job IN
+      SELECT id, job_type, payload, started_at
+      FROM public.job_queue
+      WHERE status = 'processing'
+        AND started_at < NOW() - INTERVAL '30 minutes'
+    LOOP
+      PERFORM public.create_alert(
+        'job_stuck',
+        'error',
+        'Job stuck in processing: ' || v_job.job_type,
+        'Job started at ' || v_job.started_at::TEXT || ' has been processing for over 30 minutes',
+        jsonb_build_object('job_id', v_job.id, 'job_type', v_job.job_type, 'payload', v_job.payload)
+      );
+    END LOOP;
+  END IF;
+
+  RETURN v_stuck_count;
+END;
+$$;
+
+-- Fonction de monitoring: jobs échoués récents
+CREATE OR REPLACE FUNCTION public.monitor_failed_jobs()
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_failed_count INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_failed_count
+  FROM public.job_queue
+  WHERE status = 'failed'
+    AND completed_at > NOW() - INTERVAL '1 hour';
+
+  IF v_failed_count >= 5 THEN
+    PERFORM public.create_alert(
+      'job_failed',
+      'warning',
+      v_failed_count || ' jobs failed in the last hour',
+      'Multiple job failures detected, investigate job_queue for details',
+      (SELECT jsonb_agg(jsonb_build_object('id', id, 'type', job_type, 'error', last_error))
+       FROM public.job_queue
+       WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '1 hour')
+    );
+  END IF;
+
+  RETURN v_failed_count;
+END;
+$$;
+
+-- Fonction de monitoring: drift financier
+CREATE OR REPLACE FUNCTION public.monitor_financial_drift()
+RETURNS TABLE (
+  issue_type TEXT,
+  details JSONB
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_unbalanced_count INTEGER;
+  v_missing_revenues INTEGER;
+  v_orphan_allocations INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_unbalanced_count
+  FROM (SELECT * FROM public.audit_unbalanced_ledger_entries()) sub;
+
+  IF v_unbalanced_count > 0 THEN
+    PERFORM public.create_alert(
+      'balance_mismatch',
+      'critical',
+      v_unbalanced_count || ' transaction groups with unbalanced ledger entries',
+      'Critical: Double-entry accounting invariant violated',
+      (SELECT jsonb_agg(row_to_json(sub)) FROM public.audit_unbalanced_ledger_entries() sub)
+    );
+    RETURN QUERY SELECT 'unbalanced_ledger'::TEXT,
+      (SELECT jsonb_agg(row_to_json(sub)) FROM public.audit_unbalanced_ledger_entries() sub);
+  END IF;
+
+  SELECT COUNT(*) INTO v_missing_revenues
+  FROM public.orders o
+  WHERE o.status = 'completed'
+    AND o.completed_at < NOW() - INTERVAL '1 hour'
+    AND NOT EXISTS (SELECT 1 FROM public.seller_revenues sr WHERE sr.order_id = o.id);
+
+  IF v_missing_revenues > 0 THEN
+    PERFORM public.create_alert(
+      'commission_drift',
+      'error',
+      v_missing_revenues || ' completed orders without seller_revenues',
+      'Commission distribution may have failed',
+      (SELECT jsonb_agg(o.id)
+       FROM public.orders o
+       WHERE o.status = 'completed'
+         AND o.completed_at < NOW() - INTERVAL '1 hour'
+         AND NOT EXISTS (SELECT 1 FROM public.seller_revenues sr WHERE sr.order_id = o.id))
+    );
+    RETURN QUERY SELECT 'missing_revenues'::TEXT,
+      jsonb_build_object('count', v_missing_revenues);
+  END IF;
+
+  SELECT COUNT(*) INTO v_orphan_allocations
+  FROM public.withdrawal_allocations wa
+  LEFT JOIN public.withdrawals w ON w.id = wa.withdrawal_id
+  WHERE w.id IS NULL;
+
+  IF v_orphan_allocations > 0 THEN
+    RETURN QUERY SELECT 'orphan_allocations'::TEXT,
+      jsonb_build_object('count', v_orphan_allocations);
+  END IF;
+
+  RETURN;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.monitor_stuck_jobs() TO service_role;
+GRANT EXECUTE ON FUNCTION public.monitor_failed_jobs() TO service_role;
+GRANT EXECUTE ON FUNCTION public.monitor_financial_drift() TO service_role;
+
+-- Fonction cron de monitoring global
+CREATE OR REPLACE FUNCTION public.run_monitoring_checks()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_result JSONB := '{}'::jsonb;
+BEGIN
+  v_result := v_result || jsonb_build_object('stuck_jobs', public.monitor_stuck_jobs());
+  v_result := v_result || jsonb_build_object('failed_jobs', public.monitor_failed_jobs());
+  v_result := v_result || jsonb_build_object('financial_drift',
+    (SELECT COALESCE(jsonb_agg(row_to_json(sub)), '[]'::jsonb) FROM public.monitor_financial_drift() sub));
+  v_result := v_result || jsonb_build_object('checked_at', NOW());
+
+  RETURN v_result;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.run_monitoring_checks() TO service_role;
+
+-- Fonction pour rejouer un webhook manuellement
+CREATE OR REPLACE FUNCTION public.replay_webhook(
+  p_event_id TEXT,
+  p_force BOOLEAN DEFAULT FALSE
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_webhook public.processed_webhooks%ROWTYPE;
+BEGIN
+  IF NOT public.is_admin() AND NOT public.is_service_role() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
+  END IF;
+
+  SELECT * INTO v_webhook FROM public.processed_webhooks WHERE event_id = p_event_id;
+
+  IF v_webhook.event_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'WEBHOOK_NOT_FOUND');
+  END IF;
+
+  IF p_force THEN
+    DELETE FROM public.processed_webhooks WHERE event_id = p_event_id;
+
+    INSERT INTO public.audit_logs (event_name, table_name, record_id, new_values)
+    VALUES ('webhook_replay_forced', 'processed_webhooks', NULL,
+      jsonb_build_object('event_id', p_event_id, 'event_type', v_webhook.event_type));
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'message', 'Webhook removed from processed_webhooks, can be replayed',
+      'event_type', v_webhook.event_type
+    );
+  ELSE
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'WEBHOOK_ALREADY_PROCESSED',
+      'event_type', v_webhook.event_type,
+      'processed_at', v_webhook.processed_at,
+      'hint', 'Use p_force=TRUE to force replay'
+    );
+  END IF;
+END;
+$$;
+
+-- Fonction pour relancer une distribution de commissions
+CREATE OR REPLACE FUNCTION public.reprocess_commission_distribution(
+  p_order_id UUID,
+  p_force BOOLEAN DEFAULT FALSE
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_order public.orders%ROWTYPE;
+  v_run public.commission_runs%ROWTYPE;
+BEGIN
+  IF NOT public.is_admin() AND NOT public.is_service_role() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
+  END IF;
+
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id;
+  IF v_order.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_FOUND');
+  END IF;
+
+  IF v_order.status != 'completed' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'ORDER_NOT_COMPLETED', 'status', v_order.status);
+  END IF;
+
+  SELECT * INTO v_run FROM public.commission_runs WHERE order_id = p_order_id;
+
+  IF v_run.completed AND NOT p_force THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'COMMISSION_ALREADY_DISTRIBUTED',
+      'completed_at', v_run.completed_at,
+      'result', v_run.result,
+      'hint', 'Use p_force=TRUE to force reprocess (will create duplicate entries!)'
+    );
+  END IF;
+
+  IF p_force AND v_run.completed THEN
+    DELETE FROM public.commission_runs WHERE order_id = p_order_id;
+
+    INSERT INTO public.audit_logs (event_name, table_name, record_id, old_values, new_values)
+    VALUES ('commission_reprocess_forced', 'commission_runs', p_order_id,
+      row_to_json(v_run)::jsonb,
+      jsonb_build_object('forced_by', auth.uid(), 'forced_at', NOW()));
+  END IF;
+
+  PERFORM public.enqueue_job('distribute_commissions', jsonb_build_object('order_id', p_order_id), 10);
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'message', 'Commission distribution job enqueued',
+    'order_id', p_order_id,
+    'was_forced', p_force AND v_run.completed
+  );
+END;
+$$;
+
+-- Fonction pour corriger un retrait échoué
+CREATE OR REPLACE FUNCTION public.fix_failed_withdrawal(
+  p_withdrawal_id UUID,
+  p_action TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_withdrawal public.withdrawals%ROWTYPE;
+BEGIN
+  IF NOT public.is_admin() AND NOT public.is_service_role() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'UNAUTHORIZED');
+  END IF;
+
+  SELECT * INTO v_withdrawal FROM public.withdrawals WHERE id = p_withdrawal_id;
+  IF v_withdrawal.id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'WITHDRAWAL_NOT_FOUND');
+  END IF;
+
+  IF v_withdrawal.status NOT IN ('failed', 'processing') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_STATUS', 'status', v_withdrawal.status);
+  END IF;
+
+  IF p_action = 'retry' THEN
+    UPDATE public.withdrawals SET status = 'pending', failure_reason = NULL, updated_at = NOW()
+    WHERE id = p_withdrawal_id;
+    RETURN jsonb_build_object('success', true, 'message', 'Withdrawal reset to pending for retry');
+  ELSIF p_action = 'cancel' THEN
+    PERFORM public.confirm_withdrawal_failure(p_withdrawal_id, 'Manually cancelled by admin');
+    RETURN jsonb_build_object('success', true, 'message', 'Withdrawal cancelled and revenues released');
+  ELSE
+    RETURN jsonb_build_object('success', false, 'error', 'INVALID_ACTION', 'valid_actions', ARRAY['retry', 'cancel']);
+  END IF;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.replay_webhook(TEXT, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.reprocess_commission_distribution(UUID, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.fix_failed_withdrawal(UUID, TEXT) TO service_role;
+
+-- Table pour tracker les événements Stripe reçus
+CREATE TABLE IF NOT EXISTS public.stripe_event_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_id TEXT NOT NULL UNIQUE,
+  event_type TEXT NOT NULL,
+  resource_type TEXT,
+  resource_id TEXT,
+  event_created BIGINT,
+  received_at TIMESTAMPTZ DEFAULT NOW(),
+  processed BOOLEAN DEFAULT FALSE,
+  processed_at TIMESTAMPTZ,
+  depends_on_event TEXT,
+  error TEXT,
+  retry_count INTEGER DEFAULT 0
+);
+CREATE INDEX idx_stripe_event_log_resource ON public.stripe_event_log(resource_type, resource_id);
+CREATE INDEX idx_stripe_event_log_pending ON public.stripe_event_log(processed, received_at) WHERE processed = FALSE;
+CREATE INDEX idx_stripe_event_log_depends ON public.stripe_event_log(depends_on_event) WHERE depends_on_event IS NOT NULL;
+
+ALTER TABLE public.stripe_event_log ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "stripe_event_log_service" ON public.stripe_event_log FOR ALL USING (public.is_service_role());
+
+-- Fonction pour vérifier si un événement peut être traité
+CREATE OR REPLACE FUNCTION public.can_process_stripe_event(p_event_id TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_event public.stripe_event_log%ROWTYPE;
+  v_depends_processed BOOLEAN;
+BEGIN
+  SELECT * INTO v_event FROM public.stripe_event_log WHERE event_id = p_event_id;
+
+  IF v_event.id IS NULL THEN RETURN FALSE; END IF;
+  IF v_event.processed THEN RETURN FALSE; END IF;
+  IF v_event.depends_on_event IS NULL THEN RETURN TRUE; END IF;
+
+  SELECT processed INTO v_depends_processed
+  FROM public.stripe_event_log
+  WHERE event_id = v_event.depends_on_event;
+
+  RETURN COALESCE(v_depends_processed, FALSE);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.can_process_stripe_event(TEXT) TO service_role;
+
+-- Trigger de validation FK polymorphe pour withdrawal_allocations
+CREATE OR REPLACE FUNCTION public.validate_withdrawal_allocation_revenue()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.revenue_type = 'seller' THEN
+    IF NOT EXISTS (SELECT 1 FROM public.seller_revenues WHERE id = NEW.revenue_id) THEN
+      RAISE EXCEPTION 'Invalid revenue_id: seller_revenues record not found'
+        USING ERRCODE = 'foreign_key_violation';
+    END IF;
+  ELSIF NEW.revenue_type = 'agent' THEN
+    IF NOT EXISTS (SELECT 1 FROM public.agent_revenues WHERE id = NEW.revenue_id) THEN
+      RAISE EXCEPTION 'Invalid revenue_id: agent_revenues record not found'
+        USING ERRCODE = 'foreign_key_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_validate_withdrawal_allocation ON public.withdrawal_allocations;
+CREATE TRIGGER trg_validate_withdrawal_allocation
+BEFORE INSERT OR UPDATE ON public.withdrawal_allocations
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_withdrawal_allocation_revenue();
+
+-- Fonction de cleanup pour affiliate_clicks
+CREATE OR REPLACE FUNCTION public.archive_old_affiliate_clicks()
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_deleted INTEGER;
+BEGIN
+  DELETE FROM public.affiliate_clicks
+  WHERE clicked_at < NOW() - INTERVAL '90 days';
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+  IF v_deleted > 0 THEN
+    INSERT INTO public.system_logs (level, event_type, message, details)
+    VALUES ('info', 'affiliate_clicks_cleanup',
+      v_deleted || ' old affiliate clicks archived/deleted',
+      jsonb_build_object('deleted_count', v_deleted, 'threshold', '90 days'));
+  END IF;
+
+  RETURN v_deleted;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.archive_old_affiliate_clicks() TO service_role;
+
+-- ============================================================================
+-- V40.12: CRON SCHEDULING & STATE MACHINE
+-- ============================================================================
+
+-- Enable pg_cron if available
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA pg_catalog;
+  END IF;
+EXCEPTION
+  WHEN insufficient_privilege THEN
+    RAISE NOTICE 'pg_cron extension requires superuser. Use external cron services instead.';
+  WHEN OTHERS THEN
+    RAISE NOTICE 'pg_cron extension not available: %', SQLERRM;
+END;
+$$;
+
+-- Schedule jobs if pg_cron is available
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    -- Job Worker: Every minute
+    PERFORM cron.schedule('job-worker', '* * * * *',
+      $job$ SELECT net.http_post(
+        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/job-worker',
+        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+        body := '{"max_jobs": 20}'::jsonb
+      ); $job$
+    );
+
+    -- Process Withdrawals: Every 5 minutes
+    PERFORM cron.schedule('process-withdrawals', '*/5 * * * *',
+      $job$ SELECT net.http_post(
+        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-process-withdrawals',
+        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+        body := '{}'::jsonb
+      ); $job$
+    );
+
+    -- Monitoring: Every 15 minutes
+    PERFORM cron.schedule('monitoring', '*/15 * * * *',
+      $job$ SELECT net.http_post(
+        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cron-monitoring',
+        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+        body := '{}'::jsonb
+      ); $job$
+    );
+
+    -- Cleanup Orphan Orders: Daily at 3:00 AM UTC
+    PERFORM cron.schedule('cleanup-orphan-orders', '0 3 * * *',
+      $job$ SELECT net.http_post(
+        url := current_setting('app.settings.supabase_url', true) || '/functions/v1/cleanup-orphan-orders',
+        headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.cron_secret', true), 'Content-Type', 'application/json'),
+        body := '{}'::jsonb
+      ); $job$
+    );
+
+    -- Daily Analytics: 1:00 AM UTC
+    PERFORM cron.schedule('aggregate-analytics', '0 1 * * *',
+      $job$ SELECT public.aggregate_daily_stats(CURRENT_DATE - INTERVAL '1 day'); $job$
+    );
+
+    -- Auto-complete Orders: Every hour
+    PERFORM cron.schedule('auto-complete-orders', '0 * * * *',
+      $job$ SELECT public.auto_complete_orders(); $job$
+    );
+
+    -- Auto-cancel Expired: Every 30 minutes
+    PERFORM cron.schedule('auto-cancel-expired', '*/30 * * * *',
+      $job$ SELECT public.auto_cancel_expired_orders(); $job$
+    );
+
+    -- Cleanup Old Data: Weekly on Sunday 4:00 AM UTC
+    PERFORM cron.schedule('cleanup-old-data', '0 4 * * 0',
+      $job$ SELECT public.cleanup_old_data(); $job$
+    );
+
+    -- Release Pending Revenues: Hourly at :30
+    PERFORM cron.schedule('release-revenues', '30 * * * *',
+      $job$ SELECT public.release_pending_revenues(); $job$
+    );
+
+    RAISE NOTICE 'pg_cron jobs scheduled successfully';
+  ELSE
+    RAISE NOTICE 'pg_cron not available. Use external cron services.';
+  END IF;
+END;
+$$;
+
+-- Order State Machine Trigger
+CREATE OR REPLACE FUNCTION public.validate_order_transition()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_allowed_transitions JSONB;
+BEGIN
+  IF OLD.status = NEW.status THEN
+    RETURN NEW;
+  END IF;
+
+  v_allowed_transitions := '{
+    "pending": ["payment_authorized", "cancelled"],
+    "payment_authorized": ["accepted", "cancelled"],
+    "accepted": ["in_progress", "cancelled"],
+    "in_progress": ["delivered", "cancelled"],
+    "delivered": ["revision_requested", "completed", "disputed"],
+    "revision_requested": ["delivered", "disputed", "cancelled"],
+    "completed": ["disputed", "refunded"],
+    "disputed": ["completed", "refunded", "cancelled"],
+    "cancelled": [],
+    "refunded": []
+  }'::JSONB;
+
+  IF NOT (v_allowed_transitions->OLD.status) ? NEW.status THEN
+    INSERT INTO public.system_logs (event_type, message, details)
+    VALUES (
+      'security',
+      'Invalid order status transition attempted',
+      jsonb_build_object('order_id', NEW.id, 'from_status', OLD.status, 'to_status', NEW.status, 'attempted_at', NOW())
+    );
+
+    RAISE EXCEPTION 'Invalid order status transition: % -> % is not allowed',
+      OLD.status, NEW.status
+      USING HINT = 'Valid transitions from ' || OLD.status || ': ' || COALESCE((v_allowed_transitions->OLD.status)::TEXT, '[]');
+  END IF;
+
+  INSERT INTO public.order_status_history (order_id, old_status, new_status, changed_by, reason)
+  VALUES (
+    NEW.id,
+    OLD.status,
+    NEW.status,
+    COALESCE(auth.uid(), '00000000-0000-0000-0000-000000000000'::UUID),
+    'State transition validated by trigger'
+  );
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_validate_order_transition ON public.orders;
+CREATE TRIGGER trg_validate_order_transition
+  BEFORE UPDATE OF status ON public.orders
+  FOR EACH ROW
+  EXECUTE FUNCTION public.validate_order_transition();
+
+-- Additional V40.12 indexes
+CREATE INDEX IF NOT EXISTS idx_orders_stripe_pi ON public.orders(stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_withdrawals_pending ON public.withdrawals(status, created_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_withdrawals_processing ON public.withdrawals(status, updated_at) WHERE status = 'processing';
+CREATE INDEX IF NOT EXISTS idx_job_queue_priority ON public.job_queue(priority DESC, scheduled_at ASC) WHERE status = 'pending';
+
+GRANT EXECUTE ON FUNCTION public.validate_order_transition() TO service_role;
 
 COMMIT;
