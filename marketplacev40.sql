@@ -1,6 +1,14 @@
 -- ============================================================================
--- COLLABMARKET V40.15 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
+-- COLLABMARKET V40.16 - PRODUCTION READY MULTI-ROLE SAAS EDITION (HARDENED)
 -- ============================================================================
+-- [CHANGELOG V40.16]
+-- HARDENING & COMPATIBILITY:
+-- [FIX] collabmarket_listings: Fixed column references (starting_price->base_price, seller_type->service_role)
+-- [FIX] create_complete_gig(): Fixed column names, added slug generation, package validation
+-- [FIX] complete_job(): Now auto-moves failed jobs to DLQ when max_attempts reached
+-- [TEST] Added smoke test DO block to validate migration (tables, functions, indexes, views, RLS)
+-- [GRANT] Fixed create_complete_gig GRANT for new signature with p_service_role parameter
+--
 -- [CHANGELOG V40.15]
 -- CRITICAL SECURITY FIX:
 -- [SEC-P0] is_service_role(): REMOVED current_user='postgres' check that bypassed RLS
@@ -1847,6 +1855,7 @@ END;
 $$;
 
 -- Marquer un job comme complété ou échoué
+-- V40.16: Enhanced to auto-move permanently failed jobs to DLQ
 CREATE OR REPLACE FUNCTION public.complete_job(
   p_job_id UUID,
   p_success BOOLEAN,
@@ -1863,13 +1872,12 @@ BEGIN
     SET status = 'completed', completed_at = NOW()
     WHERE id = p_job_id;
   ELSE
-    -- Échec: retry avec backoff exponentiel ou marquer comme failed
+    -- Failure: retry with exponential backoff or move to DLQ
     IF v_job.attempts >= v_job.max_attempts THEN
-      UPDATE public.job_queue
-      SET status = 'failed', last_error = p_error, completed_at = NOW()
-      WHERE id = p_job_id;
+      -- V40.16: Auto-move to Dead Letter Queue instead of just marking failed
+      PERFORM public.move_job_to_dlq(p_job_id, COALESCE(p_error, 'Max attempts reached'));
     ELSE
-      -- Reschedule avec backoff exponentiel: 2^attempts minutes
+      -- Reschedule with exponential backoff: 2^attempts minutes
       UPDATE public.job_queue
       SET status = 'pending',
           last_error = p_error,
@@ -4112,6 +4120,7 @@ CREATE POLICY "audit_orders_admin_read" ON public.audit_orders FOR SELECT USING 
 CREATE POLICY "audit_orders_service_insert" ON public.audit_orders FOR INSERT WITH CHECK (public.is_service_role());
 
 -- collabmarket_listings - legacy gigs/services view for affiliate links
+-- V40.16: Fixed column references (starting_price->base_price, seller_type->service_role)
 CREATE OR REPLACE VIEW public.collabmarket_listings AS
 SELECT
   s.id,
@@ -4120,12 +4129,12 @@ SELECT
   s.description,
   s.category_id,
   s.status,
-  s.starting_price,
-  s.currency,
-  s.seller_type,
+  s.base_price AS starting_price,  -- Alias for backward compatibility
+  'EUR'::text AS currency,          -- Hardcoded (no currency column in services)
+  s.service_role AS seller_type,    -- Alias for backward compatibility
   s.created_at,
   s.updated_at,
-  'service' AS listing_type
+  'service'::text AS listing_type
 FROM public.services s
 WHERE s.status = 'active';
 
@@ -4187,13 +4196,16 @@ $$;
 GRANT EXECUTE ON FUNCTION public.safe_update_order_status(UUID, TEXT, TEXT) TO authenticated;
 
 -- create_complete_gig: Creates a service with packages in one transaction
+-- V40.16: Fixed column references (starting_price->base_price, seller_type->service_role)
+--         Added slug generation and min_delivery_days
 CREATE OR REPLACE FUNCTION public.create_complete_gig(
   p_title TEXT,
   p_description TEXT,
   p_category_id UUID,
   p_packages JSONB,  -- Array of {name, description, price, delivery_days, revisions}
   p_tags TEXT[] DEFAULT NULL,
-  p_requirements JSONB DEFAULT NULL
+  p_requirements JSONB DEFAULT NULL,
+  p_service_role TEXT DEFAULT 'freelance'  -- 'freelance' or 'influencer'
 )
 RETURNS UUID
 LANGUAGE plpgsql
@@ -4205,8 +4217,16 @@ DECLARE
   v_service_id UUID;
   v_package JSONB;
   v_package_order INT := 1;
+  v_slug TEXT;
+  v_base_price DECIMAL;
+  v_min_delivery_days INT;
 BEGIN
-  -- Check user is verified
+  -- Check authentication
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'UNAUTHORIZED: Must be authenticated';
+  END IF;
+
+  -- Check user is verified (relaxed check - allow draft creation)
   IF NOT EXISTS (
     SELECT 1 FROM public.profiles
     WHERE id = v_user_id
@@ -4216,30 +4236,62 @@ BEGIN
     RAISE EXCEPTION 'User must complete KYC and Stripe onboarding before creating services';
   END IF;
 
+  -- Validate service_role
+  IF p_service_role NOT IN ('freelance', 'influencer') THEN
+    RAISE EXCEPTION 'Invalid service_role: must be freelance or influencer';
+  END IF;
+
+  -- Generate slug from title (using unaccent for French characters)
+  v_slug := regexp_replace(lower(unaccent(p_title)), '[^a-z0-9]+', '-', 'g');
+  v_slug := trim(both '-' from v_slug);
+  IF v_slug IS NULL OR v_slug = '' THEN
+    v_slug := 'service-' || gen_random_uuid()::text;
+  END IF;
+
+  -- Extract base_price and min_delivery_days from first package
+  v_base_price := COALESCE((p_packages->0->>'price')::DECIMAL, 5);
+  v_min_delivery_days := GREATEST(COALESCE((p_packages->0->>'delivery_days')::INT, 1), 1);
+
+  -- Ensure base_price meets minimum
+  IF v_base_price < 5 THEN
+    v_base_price := 5;
+  END IF;
+
   -- Create the service
   INSERT INTO public.services (
     seller_id,
     title,
+    slug,
     description,
     category_id,
-    status,
-    starting_price,
-    seller_type
+    service_role,
+    base_price,
+    min_delivery_days,
+    search_tags,
+    status
   )
   VALUES (
     v_user_id,
     p_title,
+    v_slug,
     p_description,
     p_category_id,
-    'draft',  -- Start as draft
-    (p_packages->0->>'price')::DECIMAL,
-    COALESCE((SELECT seller_type FROM public.profiles WHERE id = v_user_id), 'freelance')
+    p_service_role,
+    v_base_price,
+    v_min_delivery_days,
+    COALESCE(p_tags, '{}'::text[]),
+    'draft'  -- Start as draft
   )
   RETURNING id INTO v_service_id;
 
-  -- Create packages
+  -- Create packages (must be basic, standard, or premium per CHECK constraint)
   FOR v_package IN SELECT * FROM jsonb_array_elements(p_packages)
   LOOP
+    -- Validate package name
+    IF (v_package->>'name') NOT IN ('basic', 'standard', 'premium') THEN
+      RAISE EXCEPTION 'Invalid package name "%": must be basic, standard, or premium', (v_package->>'name');
+    END IF;
+
     INSERT INTO public.service_packages (
       service_id,
       name,
@@ -4253,19 +4305,13 @@ BEGIN
       v_service_id,
       v_package->>'name',
       v_package->>'description',
-      (v_package->>'price')::DECIMAL,
-      (v_package->>'delivery_days')::INT,
+      GREATEST((v_package->>'price')::DECIMAL, 5),  -- Enforce minimum price
+      GREATEST((v_package->>'delivery_days')::INT, 1),
       COALESCE((v_package->>'revisions')::INT, 1),
       v_package_order
     );
     v_package_order := v_package_order + 1;
   END LOOP;
-
-  -- Add tags if provided
-  IF p_tags IS NOT NULL THEN
-    INSERT INTO public.service_tags (service_id, tag)
-    SELECT v_service_id, unnest(p_tags);
-  END IF;
 
   -- Add requirements if provided
   IF p_requirements IS NOT NULL THEN
@@ -4281,7 +4327,8 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION public.create_complete_gig(TEXT, TEXT, UUID, JSONB, TEXT[], JSONB) TO authenticated;
+-- Note: The 7th parameter (p_service_role) has a default, so this signature covers both cases
+GRANT EXECUTE ON FUNCTION public.create_complete_gig(TEXT, TEXT, UUID, JSONB, TEXT[], JSONB, TEXT) TO authenticated;
 
 -- confirm_withdrawal_success: Finalizes a withdrawal after successful payout
 CREATE OR REPLACE FUNCTION public.confirm_withdrawal_success(
@@ -5940,5 +5987,154 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_processing ON public.withdrawals(stat
 CREATE INDEX IF NOT EXISTS idx_job_queue_priority ON public.job_queue(priority DESC, scheduled_at ASC) WHERE status = 'pending';
 
 GRANT EXECUTE ON FUNCTION public.validate_order_transition() TO service_role;
+
+-- ============================================================================
+-- V40.16: SMOKE TEST - Validation post-migration
+-- ============================================================================
+-- This DO block validates critical objects exist after migration
+-- Run after migration completes to verify installation
+
+DO $$
+DECLARE
+  v_missing_tables TEXT[] := '{}';
+  v_missing_functions TEXT[] := '{}';
+  v_missing_indexes TEXT[] := '{}';
+  v_errors TEXT := '';
+BEGIN
+  RAISE NOTICE '========================================';
+  RAISE NOTICE 'COLLABMARKET V40.16 - SMOKE TEST';
+  RAISE NOTICE '========================================';
+
+  -- Check critical tables
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'job_queue') THEN
+    v_missing_tables := array_append(v_missing_tables, 'job_queue');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'dead_letter_queue') THEN
+    v_missing_tables := array_append(v_missing_tables, 'dead_letter_queue');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'rate_limit_endpoints') THEN
+    v_missing_tables := array_append(v_missing_tables, 'rate_limit_endpoints');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'orders') THEN
+    v_missing_tables := array_append(v_missing_tables, 'orders');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'services') THEN
+    v_missing_tables := array_append(v_missing_tables, 'services');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'ledger_entries') THEN
+    v_missing_tables := array_append(v_missing_tables, 'ledger_entries');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'system_alerts') THEN
+    v_missing_tables := array_append(v_missing_tables, 'system_alerts');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'stripe_event_log') THEN
+    v_missing_tables := array_append(v_missing_tables, 'stripe_event_log');
+  END IF;
+
+  IF array_length(v_missing_tables, 1) > 0 THEN
+    v_errors := v_errors || E'\n[FAIL] Missing tables: ' || array_to_string(v_missing_tables, ', ');
+  ELSE
+    RAISE NOTICE '[OK] All critical tables exist';
+  END IF;
+
+  -- Check critical functions
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'update_order_status' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'update_order_status');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'check_rate_limit' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'check_rate_limit');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'apply_to_offer' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'apply_to_offer');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'is_service_role' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'is_service_role');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'move_job_to_dlq' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'move_job_to_dlq');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'create_complete_gig' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'create_complete_gig');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'cleanup_old_data' AND pronamespace = 'public'::regnamespace) THEN
+    v_missing_functions := array_append(v_missing_functions, 'cleanup_old_data');
+  END IF;
+
+  IF array_length(v_missing_functions, 1) > 0 THEN
+    v_errors := v_errors || E'\n[FAIL] Missing functions: ' || array_to_string(v_missing_functions, ', ');
+  ELSE
+    RAISE NOTICE '[OK] All critical functions exist';
+  END IF;
+
+  -- Check critical indexes (V40.6+)
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_services_search_tags') THEN
+    v_missing_indexes := array_append(v_missing_indexes, 'idx_services_search_tags');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_job_queue_pending') THEN
+    v_missing_indexes := array_append(v_missing_indexes, 'idx_job_queue_pending');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_rate_limits_cleanup') THEN
+    v_missing_indexes := array_append(v_missing_indexes, 'idx_rate_limits_cleanup');
+  END IF;
+
+  IF array_length(v_missing_indexes, 1) > 0 THEN
+    v_errors := v_errors || E'\n[FAIL] Missing indexes: ' || array_to_string(v_missing_indexes, ', ');
+  ELSE
+    RAISE NOTICE '[OK] All critical indexes exist';
+  END IF;
+
+  -- Check views compile
+  BEGIN
+    PERFORM * FROM public.collabmarket_listings LIMIT 0;
+    RAISE NOTICE '[OK] collabmarket_listings view compiles';
+  EXCEPTION WHEN OTHERS THEN
+    v_errors := v_errors || E'\n[FAIL] collabmarket_listings view error: ' || SQLERRM;
+  END;
+
+  -- Check materialized views exist
+  IF EXISTS (SELECT 1 FROM pg_matviews WHERE schemaname = 'public' AND matviewname = 'mv_seller_stats') THEN
+    RAISE NOTICE '[OK] Materialized views exist';
+  ELSE
+    RAISE NOTICE '[WARN] Materialized views not yet created (run refresh_stats_views())';
+  END IF;
+
+  -- Check RLS is enabled on critical tables
+  IF EXISTS (
+    SELECT 1 FROM pg_tables t
+    WHERE t.schemaname = 'public'
+      AND t.tablename IN ('orders', 'services', 'profiles', 'ledger_entries')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON c.relnamespace = n.oid
+        WHERE n.nspname = 'public' AND c.relname = t.tablename AND c.relrowsecurity = true
+      )
+  ) THEN
+    v_errors := v_errors || E'\n[FAIL] RLS not enabled on some critical tables';
+  ELSE
+    RAISE NOTICE '[OK] RLS enabled on critical tables';
+  END IF;
+
+  -- Check pg_cron jobs (optional)
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+    RAISE NOTICE '[OK] pg_cron extension available';
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname LIKE '%cleanup%' OR jobname LIKE '%orders%') THEN
+      RAISE NOTICE '[OK] pg_cron jobs scheduled';
+    ELSE
+      RAISE NOTICE '[WARN] pg_cron jobs not yet scheduled (run setup block)';
+    END IF;
+  ELSE
+    RAISE NOTICE '[INFO] pg_cron not available - use external scheduler';
+  END IF;
+
+  -- Final verdict
+  RAISE NOTICE '----------------------------------------';
+  IF v_errors != '' THEN
+    RAISE EXCEPTION 'SMOKE TEST FAILED:%', v_errors;
+  ELSE
+    RAISE NOTICE 'SMOKE TEST PASSED - V40.16 ready for production';
+  END IF;
+  RAISE NOTICE '========================================';
+END;
+$$;
 
 COMMIT;
